@@ -313,11 +313,13 @@ def collect_all_apps(
 
 # ── Hit-count pre-filter ──────────────────────────────────────────────────────
 
-def fetch_hit_counts() -> dict[str, int]:
+def fetch_hit_counts(debug_path: str | None = None) -> dict[str, int]:
     """
     Fetch last-hit timestamps for all security rules via the operational
     hit-count command.  Returns {rule_name: last_hit_unix_timestamp}.
     A timestamp of 0 means the rule has never been hit (or count was reset).
+
+    If debug_path is given, the raw API response is written to that file.
     """
     if ops_lib.MODE == "panorama":
         rb_tag = f"{ops_lib.RULEBASE}-rulebase"
@@ -336,6 +338,11 @@ def fetch_hit_counts() -> dict[str, int]:
         )
 
     xml_text = _post({"type": "op", "cmd": cmd, "key": ops_lib.API_KEY})
+
+    if debug_path:
+        with open(debug_path, "w", encoding="utf-8") as fh:
+            fh.write(xml_text)
+
     root = ET.fromstring(xml_text)
 
     hit_counts: dict[str, int] = {}
@@ -427,6 +434,10 @@ def main() -> None:
         help="Skip rules with no hits since the query window start (hit-count API)",
     )
     parser.add_argument(
+        "--debug-hitcount", metavar="PATH",
+        help="Write the raw hit-count API response to PATH for inspection (implies --skip-inactive)",
+    )
+    parser.add_argument(
         "--verbose", "-v", action="store_true",
         help="Show per-window date ranges, job IDs, and polling dots",
     )
@@ -437,6 +448,9 @@ def main() -> None:
 
     if args.resume and not args.output:
         parser.error("--resume requires --output so the filename is known")
+
+    if args.debug_hitcount:
+        args.skip_inactive = True
 
     VERBOSE = args.verbose
 
@@ -487,22 +501,41 @@ def main() -> None:
     # ── Hit-count pre-filter ──────────────────────────────────────────────────
     active_rules: set[str] | None = None   # None = no filter applied
     if args.skip_inactive:
+        debug_path = args.debug_hitcount or None
         print("  Fetching rule hit counts ...", end=" ", flush=True)
         try:
-            hit_counts = fetch_hit_counts()
-            start_epoch = int(start_dt.timestamp())
-            active_rules = {
-                name for name, ts in hit_counts.items() if ts >= start_epoch
-            }
-            # Rules not returned by the API at all are treated as active (safe default).
-            print(
-                f"{len(hit_counts)} rules checked — "
-                f"{len(active_rules)} active, "
-                f"{len(hit_counts) - len(active_rules)} inactive"
-            )
+            hit_counts = fetch_hit_counts(debug_path=debug_path)
+            if debug_path:
+                print(f"\n  Raw response written to: {debug_path}")
+                print("  Fetching rule hit counts ...", end=" ", flush=True)
+
+            if not hit_counts:
+                print(
+                    "warning: API returned 0 rules — "
+                    "filter disabled, all rules will be queried\n"
+                    "  Run with --debug-hitcount to inspect the raw response."
+                )
+            else:
+                start_epoch  = int(start_dt.timestamp())
+                candidate    = {name for name, ts in hit_counts.items() if ts >= start_epoch}
+
+                if not candidate:
+                    print(
+                        f"warning: all {len(hit_counts)} rules show no hits since "
+                        f"{start_dt.strftime('%Y-%m-%d')} — hit counts may have been "
+                        f"reset.\n  Filter disabled, all rules will be queried."
+                    )
+                else:
+                    # Rules not in the API response at all are treated as active.
+                    active_rules = candidate
+                    print(
+                        f"{len(hit_counts)} rules checked — "
+                        f"{len(active_rules)} active, "
+                        f"{len(hit_counts) - len(active_rules)} inactive"
+                    )
+
         except Exception as exc:
-            print(f"failed ({exc}) — skipping filter, all rules will be queried")
-            active_rules = None
+            print(f"failed ({exc}) — filter disabled, all rules will be queried")
         print()
 
     run_results: list[dict] = []
