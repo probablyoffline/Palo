@@ -26,7 +26,7 @@ Other options:
     --action allow|deny|drop|all          Filter by action (default: allow)
     --output PATH / -o PATH               Output CSV (default: rule-apps-YYYYMMDD-HHMMSS.csv)
     --resume                              Skip rules already present in the output file
-    --skip-inactive                       Skip rules with no hits since the query window
+    --skip-unused                       Skip rules with no hits since the query window
                                           start (uses the hit-count API — one call for all
                                           rules before querying begins)
     --window-hours N                      Initial query window in hours (default: 24)
@@ -108,11 +108,15 @@ def _build_query(
 
 
 def _submit_job(query: str) -> str | None:
+    return _submit_job_n(query, MAX_LOGS)
+
+
+def _submit_job_n(query: str, nlogs: int) -> str | None:
     params = {
         "type":     "log",
         "log-type": "traffic",
         "query":    query,
-        "nlogs":    str(MAX_LOGS),
+        "nlogs":    str(nlogs),
         "dir":      "backward",
         "key":      ops_lib.API_KEY,
     }
@@ -311,7 +315,7 @@ def collect_all_apps(
     return all_apps, total, complete, total_wins
 
 
-# ── Hit-count pre-filter ──────────────────────────────────────────────────────
+# ── Activity checks ───────────────────────────────────────────────────────────
 
 def fetch_hit_counts(debug_path: str | None = None) -> dict[str, int]:
     """
@@ -356,6 +360,31 @@ def fetch_hit_counts(debug_path: str | None = None) -> dict[str, int]:
                 except ValueError:
                     hit_counts[name] = 0
     return hit_counts
+
+
+def precheck_has_traffic(
+    rule_name: str,
+    start_dt: datetime.datetime,
+    end_dt: datetime.datetime,
+    action: str,
+) -> bool:
+    """
+    Submit a single nlogs=1 query for the rule. Returns True if any log
+    entry exists in the window, False if none. Returns True on any error
+    so the rule is queried rather than silently skipped.
+    """
+    try:
+        query  = _build_query(rule_name, start_dt, end_dt, action)
+        job_id = _submit_job_n(query, 1)
+        if job_id is None:
+            return True
+        result_xml = _poll_job(job_id)
+        if result_xml is None:
+            return True
+        root = ET.fromstring(result_xml)
+        return any(True for _ in root.iter("entry"))
+    except Exception:
+        return True
 
 
 # ── Resume helpers ────────────────────────────────────────────────────────────
@@ -430,12 +459,12 @@ def main() -> None:
         help=f"Minimum subdivision window in hours (default: {MIN_WINDOW_HOURS})",
     )
     parser.add_argument(
-        "--skip-inactive", action="store_true",
+        "--skip-unused", action="store_true",
         help="Skip rules with no hits since the query window start (hit-count API)",
     )
     parser.add_argument(
         "--debug-hitcount", metavar="PATH",
-        help="Write the raw hit-count API response to PATH for inspection (implies --skip-inactive)",
+        help="Write the raw hit-count API response to PATH for inspection (implies --skip-unused)",
     )
     parser.add_argument(
         "--verbose", "-v", action="store_true",
@@ -450,7 +479,7 @@ def main() -> None:
         parser.error("--resume requires --output so the filename is known")
 
     if args.debug_hitcount:
-        args.skip_inactive = True
+        args.skip_unused = True
 
     VERBOSE = args.verbose
 
@@ -492,15 +521,22 @@ def main() -> None:
     print(f"  To          : {end_dt.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"  Action      : {args.action}")
     print(f"  Window      : {args.window_hours}h initial / {args.min_window_hours}h minimum")
+    inactive_mode = "hit-count API" if not args.debug_hitcount else "hit-count API (debug)"
     print(f"  Rules       : {len(rule_names)} total / {len(remaining)} to query")
+    if args.skip_unused:
+        print(f"  Inactive    : will skip via {inactive_mode} (with precheck fallback)")
     if completed_rules:
         print(f"  Resuming    : {len(completed_rules)} already complete, skipping")
     print(f"  Output      : {output_path}  ({file_mode})")
     print()
 
-    # ── Hit-count pre-filter ──────────────────────────────────────────────────
-    active_rules: set[str] | None = None   # None = no filter applied
-    if args.skip_inactive:
+    # ── Activity pre-filter ───────────────────────────────────────────────────
+    # active_rules: set  → batch hit-count filter succeeded; only these are queried
+    # active_rules: None → no batch filter; use per-rule precheck if skip_unused
+    active_rules: set[str] | None = None
+    use_precheck = False
+
+    if args.skip_unused:
         debug_path = args.debug_hitcount or None
         print("  Fetching rule hit counts ...", end=" ", flush=True)
         try:
@@ -510,32 +546,30 @@ def main() -> None:
                 print("  Fetching rule hit counts ...", end=" ", flush=True)
 
             if not hit_counts:
-                print(
-                    "warning: API returned 0 rules — "
-                    "filter disabled, all rules will be queried\n"
-                    "  Run with --debug-hitcount to inspect the raw response."
-                )
-            else:
-                start_epoch  = int(start_dt.timestamp())
-                candidate    = {name for name, ts in hit_counts.items() if ts >= start_epoch}
+                raise ValueError("API returned 0 rules")
 
-                if not candidate:
-                    print(
-                        f"warning: all {len(hit_counts)} rules show no hits since "
-                        f"{start_dt.strftime('%Y-%m-%d')} — hit counts may have been "
-                        f"reset.\n  Filter disabled, all rules will be queried."
-                    )
-                else:
-                    # Rules not in the API response at all are treated as active.
-                    active_rules = candidate
-                    print(
-                        f"{len(hit_counts)} rules checked — "
-                        f"{len(active_rules)} active, "
-                        f"{len(hit_counts) - len(active_rules)} inactive"
-                    )
+            start_epoch = int(start_dt.timestamp())
+            candidate   = {name for name, ts in hit_counts.items() if ts >= start_epoch}
+
+            if not candidate:
+                raise ValueError(
+                    f"all {len(hit_counts)} rules show no hits since "
+                    f"{start_dt.strftime('%Y-%m-%d')} — hit counts may have been reset"
+                )
+
+            active_rules = candidate
+            print(
+                f"{len(hit_counts)} rules checked — "
+                f"{len(active_rules)} active, "
+                f"{len(hit_counts) - len(active_rules)} inactive"
+            )
 
         except Exception as exc:
-            print(f"failed ({exc}) — filter disabled, all rules will be queried")
+            print(
+                f"hit-count API unavailable ({exc})\n"
+                f"  Falling back to per-rule traffic precheck (1 query per rule)."
+            )
+            use_precheck = True
         print()
 
     run_results: list[dict] = []
@@ -570,6 +604,25 @@ def main() -> None:
                 continue
 
             print(f"[{i}/{len(rule_names)}] {rule_name}", flush=True)
+
+            if use_precheck:
+                print("  precheck ...", end="  ", flush=True)
+                has_traffic = precheck_has_traffic(rule_name, start_dt, end_dt, args.action)
+                if not has_traffic:
+                    print(f"no traffic — skipped")
+                    row = {
+                        "rule":            rule_name,
+                        "app_count":       0,
+                        "apps":            "",
+                        "entries_scanned": 0,
+                        "windows_queried": 1,
+                        "complete":        "skipped",
+                    }
+                    writer.writerow(row)
+                    fh.flush()
+                    run_results.append(row)
+                    continue
+                print("traffic found — querying")
 
             all_apps, total_entries, complete, windows_queried = collect_all_apps(
                 rule_name, start_dt, end_dt,
