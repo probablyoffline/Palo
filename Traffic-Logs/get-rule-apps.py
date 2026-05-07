@@ -26,6 +26,9 @@ Other options:
     --action allow|deny|drop|all          Filter by action (default: allow)
     --output PATH / -o PATH               Output CSV (default: rule-apps-YYYYMMDD-HHMMSS.csv)
     --resume                              Skip rules already present in the output file
+    --skip-inactive                       Skip rules with no hits since the query window
+                                          start (uses the hit-count API — one call for all
+                                          rules before querying begins)
     --window-hours N                      Initial query window in hours (default: 24)
     --min-window-hours N                  Minimum subdivision window in hours (default: 1)
     --verbose / -v                        Show per-window detail, job IDs, and polling dots
@@ -278,11 +281,11 @@ def collect_all_apps(
 
     for w_idx, (win_start, win_end) in enumerate(windows, 1):
         if VERBOSE:
-            print(f"  win {w_idx:2}/{len(windows)}", end="  ", flush=True)
+            print(f"  range {w_idx:2}/{len(windows)}", end="  ", flush=True)
         else:
             fmt = "%b %d"
             print(
-                f"  win {w_idx:2}/{len(windows)}  "
+                f"  range {w_idx:2}/{len(windows)}  "
                 f"({win_start.strftime(fmt)}–{win_end.strftime(fmt)}) ...",
                 end="  ", flush=True,
             )
@@ -306,6 +309,46 @@ def collect_all_apps(
         total_wins += wins
 
     return all_apps, total, complete, total_wins
+
+
+# ── Hit-count pre-filter ──────────────────────────────────────────────────────
+
+def fetch_hit_counts() -> dict[str, int]:
+    """
+    Fetch last-hit timestamps for all security rules via the operational
+    hit-count command.  Returns {rule_name: last_hit_unix_timestamp}.
+    A timestamp of 0 means the rule has never been hit (or count was reset).
+    """
+    if ops_lib.MODE == "panorama":
+        rb_tag = f"{ops_lib.RULEBASE}-rulebase"
+        cmd = (
+            f"<show><rule-hit-count><device-group>"
+            f"<entry name='{ops_lib.DEVICE_GROUP}'>"
+            f"<{rb_tag}><entry name='security'><rules><all/></rules></entry></{rb_tag}>"
+            f"</entry></device-group></rule-hit-count></show>"
+        )
+    else:
+        cmd = (
+            f"<show><rule-hit-count><vsys>"
+            f"<entry name='{ops_lib.VSYS}'>"
+            f"<rulebase><entry name='security'><rules><all/></rules></entry></rulebase>"
+            f"</entry></vsys></rule-hit-count></show>"
+        )
+
+    xml_text = _post({"type": "op", "cmd": cmd, "key": ops_lib.API_KEY})
+    root = ET.fromstring(xml_text)
+
+    hit_counts: dict[str, int] = {}
+    for entry in root.iter("entry"):
+        ts_el = entry.find("last-hit-timestamp")
+        if ts_el is not None:                       # rule entries have this; containers don't
+            name = entry.get("name", "")
+            if name:
+                try:
+                    hit_counts[name] = int(ts_el.text or "0")
+                except ValueError:
+                    hit_counts[name] = 0
+    return hit_counts
 
 
 # ── Resume helpers ────────────────────────────────────────────────────────────
@@ -380,6 +423,10 @@ def main() -> None:
         help=f"Minimum subdivision window in hours (default: {MIN_WINDOW_HOURS})",
     )
     parser.add_argument(
+        "--skip-inactive", action="store_true",
+        help="Skip rules with no hits since the query window start (hit-count API)",
+    )
+    parser.add_argument(
         "--verbose", "-v", action="store_true",
         help="Show per-window date ranges, job IDs, and polling dots",
     )
@@ -437,6 +484,27 @@ def main() -> None:
     print(f"  Output      : {output_path}  ({file_mode})")
     print()
 
+    # ── Hit-count pre-filter ──────────────────────────────────────────────────
+    active_rules: set[str] | None = None   # None = no filter applied
+    if args.skip_inactive:
+        print("  Fetching rule hit counts ...", end=" ", flush=True)
+        try:
+            hit_counts = fetch_hit_counts()
+            start_epoch = int(start_dt.timestamp())
+            active_rules = {
+                name for name, ts in hit_counts.items() if ts >= start_epoch
+            }
+            # Rules not returned by the API at all are treated as active (safe default).
+            print(
+                f"{len(hit_counts)} rules checked — "
+                f"{len(active_rules)} active, "
+                f"{len(hit_counts) - len(active_rules)} inactive"
+            )
+        except Exception as exc:
+            print(f"failed ({exc}) — skipping filter, all rules will be queried")
+            active_rules = None
+        print()
+
     run_results: list[dict] = []
 
     with open(output_path, file_mode, newline="", encoding="utf-8") as fh:
@@ -448,6 +516,24 @@ def main() -> None:
         for i, rule_name in enumerate(rule_names, start=1):
             if rule_name in completed_rules:
                 print(f"[{i}/{len(rule_names)}] {rule_name}  (skipped — already complete)")
+                continue
+
+            if active_rules is not None and rule_name not in active_rules:
+                print(
+                    f"[{i}/{len(rule_names)}] {rule_name}  "
+                    f"(skipped — no hits since {start_dt.strftime('%Y-%m-%d')})"
+                )
+                row = {
+                    "rule":            rule_name,
+                    "app_count":       0,
+                    "apps":            "",
+                    "entries_scanned": 0,
+                    "windows_queried": 0,
+                    "complete":        "skipped",
+                }
+                writer.writerow(row)
+                fh.flush()
+                run_results.append(row)
                 continue
 
             print(f"[{i}/{len(rule_names)}] {rule_name}", flush=True)
@@ -481,16 +567,20 @@ def main() -> None:
             fh.flush()  # written to disk immediately
             run_results.append(row)
 
+    rules_queried    = sum(1 for r in run_results if r["complete"] != "skipped")
+    rules_skipped    = sum(1 for r in run_results if r["complete"] == "skipped")
     rules_with       = sum(1 for r in run_results if r["app_count"] > 0)
-    rules_none       = sum(1 for r in run_results if r["app_count"] == 0)
+    rules_none       = sum(1 for r in run_results if r["complete"] not in ("skipped",) and r["app_count"] == 0)
     rules_incomplete = sum(1 for r in run_results if r["complete"] == "no")
     total_entries    = sum(r["entries_scanned"] for r in run_results)
 
     print("=" * 62)
     print("  Done.")
-    print(f"  Rules queried    : {len(remaining)}")
+    print(f"  Rules queried    : {rules_queried}")
     if completed_rules:
-        print(f"  Rules skipped    : {len(completed_rules)}  (resumed)")
+        print(f"  Rules resumed    : {len(completed_rules)}  (skipped — already complete)")
+    if rules_skipped:
+        print(f"  Rules inactive   : {rules_skipped}  (skipped — no hits in window)")
     print(f"  With apps        : {rules_with}")
     print(f"  No traffic       : {rules_none}")
     print(f"  Incomplete (!)   : {rules_incomplete}")
