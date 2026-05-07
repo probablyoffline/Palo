@@ -45,18 +45,6 @@ VSYS         = "vsys1"
 DEVICE_GROUP = "DG-Example"
 RULEBASE     = "pre"          # "pre" or "post"
 
-# ── RFC-1918 objects ──────────────────────────────────────────────────────────
-RFC1918_GROUP = "RFC-1918"
-
-# Address objects that will be created if missing, then grouped together.
-# Keys are object names; values are ip-netmask values.
-RFC1918_OBJECTS = {
-    "RFC-1918-10.0.0.0-8":     "10.0.0.0/8",
-    "RFC-1918-172.16.0.0-12":  "172.16.0.0/12",
-    "RFC-1918-192.168.0.0-16": "192.168.0.0/16",
-}
-
-
 # ── XPath builders ────────────────────────────────────────────────────────────
 _DEVICE = "entry[@name='localhost.localdomain']"
 
@@ -90,7 +78,7 @@ def address_xpath(obj_name: str) -> str:
     return f"{_config_base()}/address/entry[@name='{obj_name}']"
 
 
-def address_group_xpath(group_name: str = RFC1918_GROUP) -> str:
+def address_group_xpath(group_name: str) -> str:
     if MODE == "panorama":
         return f"/config/shared/address-group/entry[@name='{group_name}']"
     return f"{_config_base()}/address-group/entry[@name='{group_name}']"
@@ -138,61 +126,6 @@ def is_success(xml_text: str) -> bool:
 def object_exists(xpath: str) -> bool:
     result = api_get(xpath)
     return 'status="error"' not in result and "<entry" in result
-
-
-# ── RFC-1918 group bootstrap ──────────────────────────────────────────────────
-
-def ensure_rfc1918_group(dry_run: bool = False) -> bool:
-    """
-    Verify (and create if missing) the three RFC-1918 address objects and
-    the RFC-1918 address group that references them.
-
-    In Panorama mode these objects land in /config/shared so every device
-    group can reference them without duplication.
-
-    Returns True if everything is ready, False on any API failure.
-    """
-    # 1. Address objects
-    for obj_name, subnet in RFC1918_OBJECTS.items():
-        xpath = address_xpath(obj_name)
-        if object_exists(xpath):
-            log.info("  [exists]  address object: %s (%s)", obj_name, subnet)
-            continue
-        if dry_run:
-            log.info("  [dry-run] would create address object: %s (%s)", obj_name, subnet)
-            continue
-        element = (
-            f"<ip-netmask>{subnet}</ip-netmask>"
-            f"<description>RFC-1918 range — created by ops script</description>"
-        )
-        result = api_set(xpath, element)
-        if is_success(result):
-            log.info("  [created] address object: %s (%s)", obj_name, subnet)
-        else:
-            log.error("  [FAIL]    address object: %s — %s", obj_name, result)
-            return False
-
-    # 2. Address group
-    grp_xpath = address_group_xpath()
-    if object_exists(grp_xpath):
-        log.info("  [exists]  address group:  %s", RFC1918_GROUP)
-        return True
-    if dry_run:
-        log.info("  [dry-run] would create address group: %s", RFC1918_GROUP)
-        return True
-
-    members_xml = "".join(f"<member>{n}</member>" for n in RFC1918_OBJECTS)
-    element = (
-        f"<static>{members_xml}</static>"
-        f"<description>RFC-1918 private address space — created by ops script</description>"
-    )
-    result = api_set(grp_xpath, element)
-    if is_success(result):
-        log.info("  [created] address group:  %s", RFC1918_GROUP)
-        return True
-
-    log.error("  [FAIL]    address group: %s — %s", RFC1918_GROUP, result)
-    return False
 
 
 # ── Input file loader ─────────────────────────────────────────────────────────
