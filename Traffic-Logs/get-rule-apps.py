@@ -303,7 +303,9 @@ def collect_all_apps(
             if count == 0:
                 print("no traffic", flush=True)
             elif not win_complete:
-                print(f"{count} entries  (capped → subdivided)", flush=True)
+                print(f"{count} entries  (capped → subdivided, incomplete)", flush=True)
+            elif wins > 1:
+                print(f"{count} entries  (subdivided into {wins} queries)", flush=True)
             else:
                 print(f"{count} entries", flush=True)
 
