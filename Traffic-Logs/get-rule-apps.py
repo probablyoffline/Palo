@@ -66,8 +66,11 @@ DAYS_BACK            = 7
 MAX_LOGS             = 5000
 POLL_INTERVAL        = 3    # seconds between job-status polls
 POLL_TIMEOUT         = 120  # seconds before giving up on a single job
+HTTP_TIMEOUT         = 90   # seconds for each HTTP request (increase if Panorama is slow)
 INITIAL_WINDOW_HOURS = 24
 MIN_WINDOW_HOURS     = 1
+MAX_QUERIES_PER_RULE = 50   # cap per rule to avoid exhausting Panorama's job queue
+QUERY_DELAY          = 0    # extra seconds to sleep between query submissions
 
 VERBOSE = False  # set from --verbose flag at startup
 
@@ -83,7 +86,7 @@ def _post(params: dict) -> str:
         f"https://{ops_lib.TARGET_HOST}/api/",
         data=params,
         verify=False,
-        timeout=30,
+        timeout=HTTP_TIMEOUT,
     )
     r.raise_for_status()
     return r.text
@@ -156,10 +159,11 @@ def _query_window(
     end_dt: datetime.datetime,
     action: str,
     indent: int = 0,
-) -> tuple[set[str], int, bool]:
+) -> tuple[set[str], int, bool, bool]:
     """
-    Query one time window. Returns (apps, entry_count, capped).
-    On error or timeout returns empty results and capped=False.
+    Query one time window. Returns (apps, entry_count, capped, ok).
+    ok=False means the query failed or timed out — treat the window as
+    incomplete rather than as genuine no-traffic.
     """
     pad = "  " * indent
 
@@ -175,15 +179,17 @@ def _query_window(
         job_id = _submit_job(query)
         if job_id is None:
             if VERBOSE:
-                print("submission failed")
-            return set(), 0, False
+                print("submission failed", flush=True)
+            return set(), 0, False, False   # ok=False
 
         if VERBOSE:
             print(f"job:{job_id} polling", end="", flush=True)
 
         result_xml = _poll_job(job_id)
         if result_xml is None:
-            return set(), 0, False
+            if VERBOSE:
+                print("  (timeout)", flush=True)
+            return set(), 0, False, False   # ok=False
 
         root  = ET.fromstring(result_xml)
         apps  = set()
@@ -200,12 +206,21 @@ def _query_window(
             cap_note = "  *** CAPPED ***" if capped else ""
             print(f"  ({count} entries){cap_note}", flush=True)
 
-        return apps, count, capped
+        if QUERY_DELAY > 0:
+            time.sleep(QUERY_DELAY)
+
+        return apps, count, capped, True    # ok=True
 
     except Exception as exc:
         if VERBOSE:
             print(f"  error: {exc}", flush=True)
-        return set(), 0, False
+        else:
+            fmt = "%b %d %H:%M"
+            print(
+                f"  error [{start_dt.strftime(fmt)}–{end_dt.strftime(fmt)}]: {exc}",
+                flush=True,
+            )
+        return set(), 0, False, False       # ok=False
 
 
 # ── Adaptive pagination ───────────────────────────────────────────────────────
@@ -217,27 +232,45 @@ def _collect_window(
     action: str,
     min_hours: float,
     indent: int = 0,
+    budget: list[int] | None = None,
 ) -> tuple[set[str], int, bool, int]:
     """
     Recursively collect apps for [start_dt, end_dt].
-    Halves the window on a cap until min_hours is reached.
+    Halves the window on a cap until min_hours is reached or budget is exhausted.
+
+    budget is a one-element list used as a shared mutable counter across all
+    recursive calls for a single rule. When it reaches 0, subdivision stops
+    and the window is marked incomplete.
 
     Returns (apps, entries_scanned, complete, windows_queried).
     """
-    apps, count, capped = _query_window(rule_name, start_dt, end_dt, action, indent)
+    if budget is not None and budget[0] <= 0:
+        return set(), 0, False, 0
+
+    apps, count, capped, ok = _query_window(rule_name, start_dt, end_dt, action, indent)
+
+    if budget is not None:
+        budget[0] -= 1
+
+    if not ok:
+        return apps, count, False, 1   # error/timeout — mark incomplete
 
     window_hours = (end_dt - start_dt).total_seconds() / 3600
 
     if capped and window_hours > min_hours:
+        if budget is not None and budget[0] <= 0:
+            # Budget exhausted mid-subdivision — mark incomplete but keep what we have.
+            return apps, count, False, 1
+
         if VERBOSE:
             pad = "  " * indent
             print(f"{pad}    subdividing...", flush=True)
         mid = start_dt + (end_dt - start_dt) / 2
         apps_l, count_l, complete_l, wins_l = _collect_window(
-            rule_name, start_dt, mid, action, min_hours, indent + 1
+            rule_name, start_dt, mid, action, min_hours, indent + 1, budget
         )
         apps_r, count_r, complete_r, wins_r = _collect_window(
-            rule_name, mid, end_dt, action, min_hours, indent + 1
+            rule_name, mid, end_dt, action, min_hours, indent + 1, budget
         )
         return (
             apps_l | apps_r,
@@ -270,10 +303,12 @@ def collect_all_apps(
     action: str,
     initial_hours: float,
     min_hours: float,
+    max_queries: int,
 ) -> tuple[set[str], int, bool, int]:
     """
     Slice [start_dt, end_dt] into initial_hours windows, then recursively
-    subdivide any that are capped.
+    subdivide any that are capped.  Total API calls across all windows for
+    this rule are capped at max_queries.
 
     Returns (apps, entries_scanned, complete, windows_queried).
     """
@@ -282,8 +317,18 @@ def collect_all_apps(
     total      = 0
     complete   = True
     total_wins = 0
+    budget     = [max_queries]   # shared mutable counter across all windows
 
     for w_idx, (win_start, win_end) in enumerate(windows, 1):
+        if budget[0] <= 0:
+            print(
+                f"  range {w_idx:2}/{len(windows)}  "
+                f"(query limit reached — {len(windows) - w_idx + 1} range(s) skipped)",
+                flush=True,
+            )
+            complete = False
+            break
+
         if VERBOSE:
             print(f"  range {w_idx:2}/{len(windows)}", end="  ", flush=True)
         else:
@@ -297,6 +342,7 @@ def collect_all_apps(
         apps, count, win_complete, wins = _collect_window(
             rule_name, win_start, win_end, action, min_hours,
             indent=1 if VERBOSE else 0,
+            budget=budget,
         )
 
         if not VERBOSE:
@@ -382,9 +428,10 @@ def precheck_has_traffic(
             return True
         result_xml = _poll_job(job_id)
         if result_xml is None:
-            return True
+            return True  # timeout — assume active
         root = ET.fromstring(result_xml)
         return any(True for _ in root.iter("entry"))
+
     except Exception:
         return True
 
@@ -465,6 +512,14 @@ def main() -> None:
         help="Skip rules with no hits since the query window start (hit-count API)",
     )
     parser.add_argument(
+        "--max-queries-per-rule", type=int, default=MAX_QUERIES_PER_RULE, metavar="N",
+        help=f"Max API queries per rule before marking incomplete (default: {MAX_QUERIES_PER_RULE})",
+    )
+    parser.add_argument(
+        "--query-delay", type=float, default=QUERY_DELAY, metavar="SECS",
+        help="Extra seconds to sleep between query submissions (default: 0)",
+    )
+    parser.add_argument(
         "--debug-hitcount", metavar="PATH",
         help="Write the raw hit-count API response to PATH for inspection (implies --skip-unused)",
     )
@@ -483,7 +538,8 @@ def main() -> None:
     if args.debug_hitcount:
         args.skip_unused = True
 
-    VERBOSE = args.verbose
+    VERBOSE     = args.verbose
+    QUERY_DELAY = args.query_delay
 
     run_dt = datetime.datetime.now()
 
@@ -523,6 +579,7 @@ def main() -> None:
     print(f"  To          : {end_dt.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"  Action      : {args.action}")
     print(f"  Window      : {args.window_hours}h initial / {args.min_window_hours}h minimum")
+    print(f"  Query cap   : {args.max_queries_per_rule} per rule")
     inactive_mode = "hit-count API" if not args.debug_hitcount else "hit-count API (debug)"
     print(f"  Rules       : {len(rule_names)} total / {len(remaining)} to query")
     if args.skip_unused:
@@ -576,6 +633,8 @@ def main() -> None:
 
     run_results: list[dict] = []
     run_start = datetime.datetime.now()
+    consecutive_no_traffic = 0
+    CONSECUTIVE_WARN = 5   # warn after this many back-to-back zero results
 
     with open(output_path, file_mode, newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=CSV_FIELDNAMES)
@@ -630,6 +689,7 @@ def main() -> None:
             all_apps, total_entries, complete, windows_queried = collect_all_apps(
                 rule_name, start_dt, end_dt,
                 args.action, args.window_hours, args.min_window_hours,
+                args.max_queries_per_rule,
             )
 
             flag = " !" if not complete else ""
@@ -655,6 +715,20 @@ def main() -> None:
             writer.writerow(row)
             fh.flush()  # written to disk immediately
             run_results.append(row)
+
+            if total_entries == 0 and row["complete"] != "skipped":
+                consecutive_no_traffic += 1
+                if consecutive_no_traffic == CONSECUTIVE_WARN:
+                    print(
+                        f"\n  *** WARNING: {CONSECUTIVE_WARN} rules in a row returned no "
+                        f"traffic. The Panorama log job queue may be exhausted. ***\n"
+                        f"  Consider stopping the run, waiting a few minutes, then "
+                        f"resuming with --resume.\n"
+                        f"  Adding --query-delay 2 on the next run can help prevent this.\n",
+                        flush=True,
+                    )
+            else:
+                consecutive_no_traffic = 0
 
     rules_queried    = sum(1 for r in run_results if r["complete"] != "skipped")
     rules_skipped    = sum(1 for r in run_results if r["complete"] == "skipped")
