@@ -575,6 +575,7 @@ def main() -> None:
         print()
 
     run_results: list[dict] = []
+    run_start = datetime.datetime.now()
 
     with open(output_path, file_mode, newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=CSV_FIELDNAMES)
@@ -662,8 +663,12 @@ def main() -> None:
     rules_incomplete = sum(1 for r in run_results if r["complete"] == "no")
     total_entries    = sum(r["entries_scanned"] for r in run_results)
 
+    elapsed = datetime.datetime.now() - run_start
+    elapsed_str = str(elapsed).split(".")[0]  # HH:MM:SS, no microseconds
+
     print("=" * 62)
     print("  Done.")
+    print(f"  Elapsed          : {elapsed_str}")
     print(f"  Rules queried    : {rules_queried}")
     if completed_rules:
         print(f"  Rules resumed    : {len(completed_rules)}  (skipped — already complete)")
