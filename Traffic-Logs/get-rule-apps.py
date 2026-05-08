@@ -49,9 +49,11 @@ Before running: set MODE / VSYS / DEVICE_GROUP in ops_lib.py.
 """
 
 import argparse
+import concurrent.futures
 import csv
 import datetime
 import sys
+import threading
 import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -72,7 +74,11 @@ MIN_WINDOW_HOURS     = 1
 MAX_QUERIES_PER_RULE = 50   # cap per rule to avoid exhausting Panorama's job queue
 QUERY_DELAY          = 0    # extra seconds to sleep between query submissions
 
-VERBOSE = False  # set from --verbose flag at startup
+VERBOSE  = False  # set from --verbose flag at startup
+PARALLEL = False  # set to True when workers > 1; suppresses per-window prints
+
+_print_lock = threading.Lock()
+_csv_lock   = threading.Lock()
 
 CSV_FIELDNAMES = ["rule", "app_count", "apps", "entries_scanned", "windows_queried", "complete"]
 
@@ -321,23 +327,25 @@ def collect_all_apps(
 
     for w_idx, (win_start, win_end) in enumerate(windows, 1):
         if budget[0] <= 0:
-            print(
-                f"  range {w_idx:2}/{len(windows)}  "
-                f"(query limit reached — {len(windows) - w_idx + 1} range(s) skipped)",
-                flush=True,
-            )
+            if not PARALLEL:
+                print(
+                    f"  range {w_idx:2}/{len(windows)}  "
+                    f"(query limit reached — {len(windows) - w_idx + 1} range(s) skipped)",
+                    flush=True,
+                )
             complete = False
             break
 
-        if VERBOSE:
-            print(f"  range {w_idx:2}/{len(windows)}", end="  ", flush=True)
-        else:
-            fmt = "%b %d"
-            print(
-                f"  range {w_idx:2}/{len(windows)}  "
-                f"({win_start.strftime(fmt)}–{win_end.strftime(fmt)}) ...",
-                end="  ", flush=True,
-            )
+        if not PARALLEL:
+            if VERBOSE:
+                print(f"  range {w_idx:2}/{len(windows)}", end="  ", flush=True)
+            else:
+                fmt = "%b %d"
+                print(
+                    f"  range {w_idx:2}/{len(windows)}  "
+                    f"({win_start.strftime(fmt)}–{win_end.strftime(fmt)}) ...",
+                    end="  ", flush=True,
+                )
 
         apps, count, win_complete, wins = _collect_window(
             rule_name, win_start, win_end, action, min_hours,
@@ -345,7 +353,7 @@ def collect_all_apps(
             budget=budget,
         )
 
-        if not VERBOSE:
+        if not PARALLEL and not VERBOSE:
             if count == 0:
                 print("no traffic", flush=True)
             elif not win_complete:
@@ -451,6 +459,69 @@ def load_completed_rules(output_path: str) -> set[str]:
     return completed
 
 
+# ── Parallel worker ───────────────────────────────────────────────────────────
+
+def _process_rule(
+    rule_name:        str,
+    rule_index:       int,
+    total_rules:      int,
+    start_dt:         datetime.datetime,
+    end_dt:           datetime.datetime,
+    action:           str,
+    window_hours:     float,
+    min_window_hours: float,
+    max_queries:      int,
+    use_precheck:     bool,
+) -> tuple[dict, str]:
+    """
+    Process one rule in a worker thread.
+    Returns (csv_row, console_output_block).
+    """
+    lines: list[str] = [f"[{rule_index}/{total_rules}] {rule_name}"]
+
+    if use_precheck:
+        lines.append("  precheck ...")
+        has_traffic = precheck_has_traffic(rule_name, start_dt, end_dt, action)
+        if not has_traffic:
+            lines[-1] += "  no traffic — skipped"
+            row = {
+                "rule":            rule_name,
+                "app_count":       0,
+                "apps":            "",
+                "entries_scanned": 0,
+                "windows_queried": 1,
+                "complete":        "skipped",
+            }
+            return row, "\n".join(lines)
+        lines[-1] += "  traffic found — querying"
+
+    all_apps, total_entries, complete, windows_queried = collect_all_apps(
+        rule_name, start_dt, end_dt,
+        action, window_hours, min_window_hours, max_queries,
+    )
+
+    flag = " !" if not complete else ""
+    lines.append(
+        f"  → {len(all_apps)} apps | {total_entries} entries | "
+        f"{windows_queried} quer{'y' if windows_queried == 1 else 'ies'}{flag}"
+    )
+    if not complete:
+        lines.append(
+            f"  ! one or more windows hit the {MAX_LOGS}-entry cap at "
+            f"min window size — app list may be incomplete"
+        )
+
+    row = {
+        "rule":            rule_name,
+        "app_count":       len(all_apps),
+        "apps":            "|".join(sorted(all_apps)),
+        "entries_scanned": total_entries,
+        "windows_queried": windows_queried,
+        "complete":        "yes" if complete else "no",
+    }
+    return row, "\n".join(lines)
+
+
 # ── Argument parsing ──────────────────────────────────────────────────────────
 
 def _parse_datetime(s: str) -> datetime.datetime:
@@ -467,7 +538,7 @@ def _parse_datetime(s: str) -> datetime.datetime:
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    global VERBOSE
+    global VERBOSE, PARALLEL, QUERY_DELAY
 
     parser = argparse.ArgumentParser(
         description="Identify distinct applications per security rule from PAN-OS traffic logs."
@@ -524,8 +595,12 @@ def main() -> None:
         help="Write the raw hit-count API response to PATH for inspection (implies --skip-unused)",
     )
     parser.add_argument(
+        "--workers", type=int, default=2, metavar="N",
+        help="Parallel rules to query simultaneously (default: 2; increase carefully)",
+    )
+    parser.add_argument(
         "--verbose", "-v", action="store_true",
-        help="Show per-window date ranges, job IDs, and polling dots",
+        help="Show per-window date ranges, job IDs, and polling dots (workers=1 only)",
     )
     args = parser.parse_args()
 
@@ -539,7 +614,11 @@ def main() -> None:
         args.skip_unused = True
 
     VERBOSE     = args.verbose
+    PARALLEL    = args.workers > 1
     QUERY_DELAY = args.query_delay
+
+    if VERBOSE and PARALLEL:
+        print("Note: --verbose is ignored when --workers > 1", flush=True)
 
     run_dt = datetime.datetime.now()
 
@@ -580,6 +659,7 @@ def main() -> None:
     print(f"  Action      : {args.action}")
     print(f"  Window      : {args.window_hours}h initial / {args.min_window_hours}h minimum")
     print(f"  Query cap   : {args.max_queries_per_rule} per rule")
+    print(f"  Workers     : {args.workers}")
     inactive_mode = "hit-count API" if not args.debug_hitcount else "hit-count API (debug)"
     print(f"  Rules       : {len(rule_names)} total / {len(remaining)} to query")
     if args.skip_unused:
@@ -634,7 +714,23 @@ def main() -> None:
     run_results: list[dict] = []
     run_start = datetime.datetime.now()
     consecutive_no_traffic = 0
-    CONSECUTIVE_WARN = 5   # warn after this many back-to-back zero results
+    CONSECUTIVE_WARN = 5
+
+    # Worker kwargs shared across all rule submissions
+    worker_kwargs = dict(
+        start_dt         = start_dt,
+        end_dt           = end_dt,
+        action           = args.action,
+        window_hours     = args.window_hours,
+        min_window_hours = args.min_window_hours,
+        max_queries      = args.max_queries_per_rule,
+        use_precheck     = use_precheck,
+    )
+
+    def _write_row(writer, fh, row: dict) -> None:
+        with _csv_lock:
+            writer.writerow(row)
+            fh.flush()
 
     with open(output_path, file_mode, newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=CSV_FIELDNAMES)
@@ -642,93 +738,73 @@ def main() -> None:
             writer.writeheader()
             fh.flush()
 
-        for i, rule_name in enumerate(rule_names, start=1):
-            if rule_name in completed_rules:
-                print(f"[{i}/{len(rule_names)}] {rule_name}  (skipped — already complete)")
-                continue
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:
+            future_to_index: dict[concurrent.futures.Future, int] = {}
 
-            if active_rules is not None and rule_name not in active_rules:
-                print(
-                    f"[{i}/{len(rule_names)}] {rule_name}  "
-                    f"(skipped — no hits since {start_dt.strftime('%Y-%m-%d')})"
-                )
-                row = {
-                    "rule":            rule_name,
-                    "app_count":       0,
-                    "apps":            "",
-                    "entries_scanned": 0,
-                    "windows_queried": 0,
-                    "complete":        "skipped",
-                }
-                writer.writerow(row)
-                fh.flush()
-                run_results.append(row)
-                continue
+            for i, rule_name in enumerate(rule_names, start=1):
+                total = len(rule_names)
 
-            print(f"[{i}/{len(rule_names)}] {rule_name}", flush=True)
+                if rule_name in completed_rules:
+                    print(f"[{i}/{total}] {rule_name}  (skipped — already complete)")
+                    continue
 
-            if use_precheck:
-                print("  precheck ...", end="  ", flush=True)
-                has_traffic = precheck_has_traffic(rule_name, start_dt, end_dt, args.action)
-                if not has_traffic:
-                    print(f"no traffic — skipped")
+                if active_rules is not None and rule_name not in active_rules:
+                    print(
+                        f"[{i}/{total}] {rule_name}  "
+                        f"(skipped — no hits since {start_dt.strftime('%Y-%m-%d')})"
+                    )
                     row = {
                         "rule":            rule_name,
                         "app_count":       0,
                         "apps":            "",
                         "entries_scanned": 0,
-                        "windows_queried": 1,
+                        "windows_queried": 0,
                         "complete":        "skipped",
                     }
-                    writer.writerow(row)
-                    fh.flush()
+                    _write_row(writer, fh, row)
                     run_results.append(row)
                     continue
-                print("traffic found — querying")
 
-            all_apps, total_entries, complete, windows_queried = collect_all_apps(
-                rule_name, start_dt, end_dt,
-                args.action, args.window_hours, args.min_window_hours,
-                args.max_queries_per_rule,
-            )
-
-            flag = " !" if not complete else ""
-            print(
-                f"  → {len(all_apps)} apps | {total_entries} entries | "
-                f"{windows_queried} quer{'y' if windows_queried == 1 else 'ies'}{flag}"
-            )
-            if not complete:
-                print(
-                    f"  ! one or more windows hit the {MAX_LOGS}-entry cap at "
-                    f"min window size — app list may be incomplete"
+                if PARALLEL:
+                    print(f"[{i}/{total}] {rule_name}  → queuing...", flush=True)
+                future = pool.submit(
+                    _process_rule, rule_name, i, total, **worker_kwargs
                 )
-            print()
+                future_to_index[future] = i
 
-            row = {
-                "rule":            rule_name,
-                "app_count":       len(all_apps),
-                "apps":            "|".join(sorted(all_apps)),
-                "entries_scanned": total_entries,
-                "windows_queried": windows_queried,
-                "complete":        "yes" if complete else "no",
-            }
-            writer.writerow(row)
-            fh.flush()  # written to disk immediately
-            run_results.append(row)
+            # Collect results as workers finish
+            for future in concurrent.futures.as_completed(future_to_index):
+                try:
+                    row, output = future.result()
+                except Exception as exc:
+                    # Unexpected worker crash — log and continue
+                    with _print_lock:
+                        print(f"  *** worker error: {exc}", flush=True)
+                    continue
 
-            if total_entries == 0 and row["complete"] != "skipped":
-                consecutive_no_traffic += 1
-                if consecutive_no_traffic == CONSECUTIVE_WARN:
-                    print(
-                        f"\n  *** WARNING: {CONSECUTIVE_WARN} rules in a row returned no "
-                        f"traffic. The Panorama log job queue may be exhausted. ***\n"
-                        f"  Consider stopping the run, waiting a few minutes, then "
-                        f"resuming with --resume.\n"
-                        f"  Adding --query-delay 2 on the next run can help prevent this.\n",
-                        flush=True,
-                    )
-            else:
-                consecutive_no_traffic = 0
+                with _print_lock:
+                    print(output)
+                    print()
+
+                _write_row(writer, fh, row)
+                run_results.append(row)
+
+                if not PARALLEL:
+                    # Consecutive no-traffic warning only meaningful in sequential mode
+                    if row["entries_scanned"] == 0 and row["complete"] != "skipped":
+                        consecutive_no_traffic += 1
+                        if consecutive_no_traffic == CONSECUTIVE_WARN:
+                            print(
+                                f"\n  *** WARNING: {CONSECUTIVE_WARN} rules in a row "
+                                f"returned no traffic. The Panorama log job queue may be "
+                                f"exhausted. ***\n"
+                                f"  Consider stopping, waiting a few minutes, then resuming "
+                                f"with --resume.\n"
+                                f"  Adding --query-delay 2 on the next run can help.\n",
+                                flush=True,
+                            )
+                    else:
+                        consecutive_no_traffic = 0
 
     rules_queried    = sum(1 for r in run_results if r["complete"] != "skipped")
     rules_skipped    = sum(1 for r in run_results if r["complete"] == "skipped")
