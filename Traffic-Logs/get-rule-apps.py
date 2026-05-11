@@ -673,7 +673,8 @@ def main() -> None:
         sys.exit(1)
 
     timestamp   = run_dt.strftime("%Y%m%d-%H%M%S")
-    output_path = args.output or f"rule-apps-{timestamp}.csv"
+    input_stem  = Path(args.input_file).stem
+    output_path = args.output or f"rule-apps-{input_stem}-{timestamp}.csv"
 
     # Determine which rules are already done (resume mode).
     completed_rules: set[str] = set()
@@ -860,20 +861,41 @@ def main() -> None:
     elapsed = datetime.datetime.now() - run_start
     elapsed_str = str(elapsed).split(".")[0]  # HH:MM:SS, no microseconds
 
-    print("=" * 62)
-    print("  Done.")
-    print(f"  Elapsed          : {elapsed_str}")
-    print(f"  Rules queried    : {rules_queried}")
+    p            = Path(output_path)
+    summary_path = str(p.with_name(p.stem + "-summary.txt"))
+
+    summary_lines = [
+        "=" * 62,
+        "  Done.",
+        f"  Elapsed          : {elapsed_str}",
+        f"  Target           : {ops_lib.TARGET_HOST}  ({ops_lib.mode_summary()})",
+        f"  Input            : {args.input_file}",
+        f"  From             : {start_dt.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"  To               : {end_dt.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"  Action           : {args.action}",
+        "-" * 62,
+        f"  Rules queried    : {rules_queried}",
+    ]
     if completed_rules:
-        print(f"  Rules resumed    : {len(completed_rules)}  (skipped — already complete)")
+        summary_lines.append(f"  Rules resumed    : {len(completed_rules)}  (skipped — already complete)")
     if rules_skipped:
-        print(f"  Rules inactive   : {rules_skipped}  (skipped — no hits in window)")
-    print(f"  With apps        : {rules_with}")
-    print(f"  No traffic       : {rules_none}")
-    print(f"  Incomplete (!)   : {rules_incomplete}")
-    print(f"  Total entries    : {total_entries}")
-    print(f"  Output           : {output_path}")
-    print("=" * 62)
+        summary_lines.append(f"  Rules inactive   : {rules_skipped}  (skipped — no hits in window)")
+    summary_lines += [
+        f"  With apps        : {rules_with}",
+        f"  No traffic       : {rules_none}",
+        f"  Incomplete (!)   : {rules_incomplete}",
+        f"  Total entries    : {total_entries}",
+        "-" * 62,
+        f"  Output           : {output_path}",
+        f"  Summary          : {summary_path}",
+        "=" * 62,
+    ]
+
+    summary_text = "\n".join(summary_lines)
+    print(summary_text)
+
+    with open(summary_path, "w", encoding="utf-8") as sf:
+        sf.write(summary_text + "\n")
 
 
 if __name__ == "__main__":
