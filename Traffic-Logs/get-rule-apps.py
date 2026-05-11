@@ -674,7 +674,8 @@ def main() -> None:
 
     timestamp   = run_dt.strftime("%Y%m%d-%H%M%S")
     input_stem  = Path(args.input_file).stem
-    output_path = args.output or f"rule-apps-{input_stem}-{timestamp}.csv"
+    output_path = args.output or f"Output/rule-apps-{input_stem}-{timestamp}.csv"
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
     # Determine which rules are already done (resume mode).
     completed_rules: set[str] = set()
