@@ -80,7 +80,7 @@ PARALLEL = False  # set to True when workers > 1; suppresses per-window prints
 _print_lock = threading.Lock()
 _csv_lock   = threading.Lock()
 
-CSV_FIELDNAMES = ["rule", "app_count", "apps", "entries_scanned", "windows_queried", "complete"]
+CSV_FIELDNAMES = ["rule", "app_count", "apps", "port_count", "ports", "entries_scanned", "windows_queried", "complete"]
 
 requests.packages.urllib3.disable_warnings()
 
@@ -168,8 +168,8 @@ def _query_window(
 ) -> tuple[set[str], int, bool, bool]:
     """
     Query one time window. Returns (apps, entry_count, capped, ok).
-    ok=False means the query failed or timed out — treat the window as
-    incomplete rather than as genuine no-traffic.
+    ok=False means the query failed or timed out — treat as incomplete,
+    not genuine no-traffic.
     """
     pad = "  " * indent
 
@@ -226,7 +226,7 @@ def _query_window(
                 f"  error [{start_dt.strftime(fmt)}–{end_dt.strftime(fmt)}]: {exc}",
                 flush=True,
             )
-        return set(), 0, False, False       # ok=False
+        return set(), set(), 0, False, False       # ok=False
 
 
 # ── Adaptive pagination ───────────────────────────────────────────────────────
@@ -459,6 +459,33 @@ def load_completed_rules(output_path: str) -> set[str]:
     return completed
 
 
+# ── Rule config helpers ───────────────────────────────────────────────────────
+
+def fetch_rule_services(rule_names: list[str]) -> dict[str, list[str]]:
+    """
+    Fetch the service members configured on each security rule via the config API.
+    Returns {rule_name: [member, ...]} for all rules found in config.
+    Rules not found or with no service element map to an empty list.
+    """
+    try:
+        xml_text = ops_lib.api_get(ops_lib.rules_xpath())
+        root = ET.fromstring(xml_text)
+    except Exception as exc:
+        print(f"  Warning: could not fetch rule services from config: {exc}", flush=True)
+        return {}
+
+    wanted = set(rule_names)
+    result: dict[str, list[str]] = {}
+    for entry in root.iter("entry"):
+        name = entry.get("name", "")
+        if name not in wanted:
+            continue
+        svc_el  = entry.find("service")
+        members = [m.text for m in svc_el.findall("member") if m.text] if svc_el is not None else []
+        result[name] = sorted(members)
+    return result
+
+
 # ── Parallel worker ───────────────────────────────────────────────────────────
 
 def _process_rule(
@@ -472,12 +499,14 @@ def _process_rule(
     min_window_hours: float,
     max_queries:      int,
     use_precheck:     bool,
+    services_map:     dict[str, list[str]],
 ) -> tuple[dict, str]:
     """
     Process one rule in a worker thread.
     Returns (csv_row, console_output_block).
     """
     lines: list[str] = [f"[{rule_index}/{total_rules}] {rule_name}"]
+    services = services_map.get(rule_name, [])
 
     if use_precheck:
         lines.append("  precheck ...")
@@ -488,6 +517,8 @@ def _process_rule(
                 "rule":            rule_name,
                 "app_count":       0,
                 "apps":            "",
+                "port_count":      len(services),
+                "ports":           "|".join(services),
                 "entries_scanned": 0,
                 "windows_queried": 1,
                 "complete":        "skipped",
@@ -515,6 +546,8 @@ def _process_rule(
         "rule":            rule_name,
         "app_count":       len(all_apps),
         "apps":            "|".join(sorted(all_apps)),
+        "port_count":      len(services),
+        "ports":           "|".join(services),
         "entries_scanned": total_entries,
         "windows_queried": windows_queried,
         "complete":        "yes" if complete else "no",
@@ -669,6 +702,13 @@ def main() -> None:
     print(f"  Output      : {output_path}  ({file_mode})")
     print()
 
+    # ── Rule service config fetch ─────────────────────────────────────────────
+    print("  Fetching rule service configurations ...", end=" ", flush=True)
+    services_map = fetch_rule_services(rule_names)
+    found = sum(1 for n in rule_names if n in services_map)
+    print(f"{found}/{len(rule_names)} rules found in config")
+    print()
+
     # ── Activity pre-filter ───────────────────────────────────────────────────
     # active_rules: set  → batch hit-count filter succeeded; only these are queried
     # active_rules: None → no batch filter; use per-rule precheck if skip_unused
@@ -725,6 +765,7 @@ def main() -> None:
         min_window_hours = args.min_window_hours,
         max_queries      = args.max_queries_per_rule,
         use_precheck     = use_precheck,
+        services_map     = services_map,
     )
 
     def _write_row(writer, fh, row: dict) -> None:
@@ -753,10 +794,13 @@ def main() -> None:
                         f"[{i}/{total}] {rule_name}  "
                         f"(skipped — no hits since {start_dt.strftime('%Y-%m-%d')})"
                     )
+                    svc = services_map.get(rule_name, [])
                     row = {
                         "rule":            rule_name,
                         "app_count":       0,
                         "apps":            "",
+                        "port_count":      len(svc),
+                        "ports":           "|".join(svc),
                         "entries_scanned": 0,
                         "windows_queried": 0,
                         "complete":        "skipped",
