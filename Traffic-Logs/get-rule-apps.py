@@ -31,6 +31,9 @@ Other options:
                                           rules before querying begins)
     --window-hours N                      Initial query window in hours (default: 24)
     --min-window-hours N                  Minimum subdivision window in hours (default: 1)
+    --device-group NAME / --dg NAME        Override the device group used to fetch rule
+                                          service config and hit counts (Panorama mode only;
+                                          overrides DEVICE_GROUP in ops_lib.py for this run)
     --verbose / -v                        Show per-window detail, job IDs, and polling dots
 
 Resume after interruption:
@@ -632,6 +635,10 @@ def main() -> None:
         help="Parallel rules to query simultaneously (default: 2; increase carefully)",
     )
     parser.add_argument(
+        "--device-group", "--dg", metavar="NAME", dest="device_group",
+        help="Override the device group for rule config/hit-count lookups (Panorama mode only)",
+    )
+    parser.add_argument(
         "--verbose", "-v", action="store_true",
         help="Show per-window date ranges, job IDs, and polling dots (workers=1 only)",
     )
@@ -645,6 +652,9 @@ def main() -> None:
 
     if args.debug_hitcount:
         args.skip_unused = True
+
+    if args.device_group:
+        ops_lib.DEVICE_GROUP = args.device_group
 
     VERBOSE     = args.verbose
     PARALLEL    = args.workers > 1
