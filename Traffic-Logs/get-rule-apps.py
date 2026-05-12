@@ -470,11 +470,19 @@ def fetch_rule_services(rule_names: list[str]) -> dict[str, list[str]]:
     Returns {rule_name: [member, ...]} for all rules found in config.
     Rules not found or with no service element map to an empty list.
     """
+    xpath = ops_lib.rules_xpath()
     try:
-        xml_text = ops_lib.api_get(ops_lib.rules_xpath())
+        xml_text = ops_lib.api_get(xpath)
         root = ET.fromstring(xml_text)
     except Exception as exc:
         print(f"  Warning: could not fetch rule services from config: {exc}", flush=True)
+        print(f"  (xpath: {xpath})", flush=True)
+        return {}
+
+    if root.get("status") == "error":
+        msg = root.findtext(".//msg") or root.findtext(".//line") or "unknown error"
+        print(f"  Warning: config API returned error: {msg}", flush=True)
+        print(f"  (xpath: {xpath})", flush=True)
         return {}
 
     wanted = set(rule_names)
@@ -655,6 +663,7 @@ def main() -> None:
 
     if args.device_group:
         ops_lib.DEVICE_GROUP = args.device_group
+        ops_lib.MODE = "panorama"
 
     VERBOSE     = args.verbose
     PARALLEL    = args.workers > 1
