@@ -106,6 +106,7 @@ def _build_query(
     start_dt: datetime.datetime,
     end_dt: datetime.datetime,
     action: str,
+    exclude_apps: set[str] | None = None,
 ) -> str:
     start_str = start_dt.strftime("%Y/%m/%d %H:%M:%S")
     end_str   = end_dt.strftime("%Y/%m/%d %H:%M:%S")
@@ -116,6 +117,9 @@ def _build_query(
     ]
     if action != "all":
         parts.append(f"(action eq '{action}')")
+    if exclude_apps:
+        for app in sorted(exclude_apps):
+            parts.append(f"(app neq '{app}')")
     return " and ".join(parts)
 
 
@@ -168,6 +172,7 @@ def _query_window(
     end_dt: datetime.datetime,
     action: str,
     indent: int = 0,
+    exclude_apps: set[str] | None = None,
 ) -> tuple[set[str], int, bool, bool]:
     """
     Query one time window. Returns (apps, entry_count, capped, ok).
@@ -178,13 +183,14 @@ def _query_window(
 
     if VERBOSE:
         fmt = "%m-%d %H:%M"
+        excl = f"  excl:{len(exclude_apps)}" if exclude_apps else ""
         print(
-            f"{pad}  [{start_dt.strftime(fmt)} – {end_dt.strftime(fmt)}]",
+            f"{pad}  [{start_dt.strftime(fmt)} – {end_dt.strftime(fmt)}]{excl}",
             end="  ", flush=True,
         )
 
     try:
-        query  = _build_query(rule_name, start_dt, end_dt, action)
+        query  = _build_query(rule_name, start_dt, end_dt, action, exclude_apps)
         job_id = _submit_job(query)
         if job_id is None:
             if VERBOSE:
@@ -229,7 +235,7 @@ def _query_window(
                 f"  error [{start_dt.strftime(fmt)}–{end_dt.strftime(fmt)}]: {exc}",
                 flush=True,
             )
-        return set(), set(), 0, False, False       # ok=False
+        return set(), 0, False, False   # ok=False
 
 
 # ── Adaptive pagination ───────────────────────────────────────────────────────
@@ -245,11 +251,12 @@ def _collect_window(
 ) -> tuple[set[str], int, bool, int]:
     """
     Recursively collect apps for [start_dt, end_dt].
-    Halves the window on a cap until min_hours is reached or budget is exhausted.
+    Halves the window on a cap until min_hours is reached, then switches to
+    app-exclusion iteration to guarantee completeness without further subdivision.
 
     budget is a one-element list used as a shared mutable counter across all
-    recursive calls for a single rule. When it reaches 0, subdivision stops
-    and the window is marked incomplete.
+    recursive calls for a single rule. When it reaches 0, no further queries
+    are issued and the remaining work is marked incomplete.
 
     Returns (apps, entries_scanned, complete, windows_queried).
     """
@@ -288,7 +295,68 @@ def _collect_window(
             wins_l + wins_r,
         )
 
-    return apps, count, not capped, 1
+    if capped:
+        # capped at minimum window — switch to app-exclusion to finish this window
+        if VERBOSE:
+            pad = "  " * indent
+            print(f"{pad}    app-exclusion ...", flush=True)
+        extra_apps, extra_count, exhaust_complete, exhaust_wins = _exhaust_apps_in_window(
+            rule_name, start_dt, end_dt, action, apps,
+            indent=indent + 1 if VERBOSE else 0,
+            budget=budget,
+        )
+        return apps | extra_apps, count + extra_count, exhaust_complete, 1 + exhaust_wins
+
+    return apps, count, True, 1
+
+
+def _exhaust_apps_in_window(
+    rule_name: str,
+    start_dt: datetime.datetime,
+    end_dt: datetime.datetime,
+    action: str,
+    known_apps: set[str],
+    indent: int = 0,
+    budget: list[int] | None = None,
+) -> tuple[set[str], int, bool, int]:
+    """
+    App-exclusion iteration within a single fixed time window.
+    Used after time-subdivision reaches min_hours and the window is still capped.
+
+    Repeatedly queries with all already-found apps excluded until the result
+    is either empty or uncapped, guaranteeing all distinct apps are found.
+
+    Returns (newly_found_apps, entries_scanned, complete, queries_used).
+    """
+    found    = set()
+    all_excl = set(known_apps)
+    total    = 0
+    queries  = 0
+
+    while True:
+        if budget is not None and budget[0] <= 0:
+            return found, total, False, queries
+
+        apps, count, capped, ok = _query_window(
+            rule_name, start_dt, end_dt, action, indent, exclude_apps=all_excl,
+        )
+
+        if budget is not None:
+            budget[0] -= 1
+        queries += 1
+
+        if not ok:
+            return found, total, False, queries
+
+        total    += count
+        found    |= apps
+        all_excl |= apps
+
+        if count == 0 or not capped:
+            return found, total, True, queries
+
+        if QUERY_DELAY > 0:
+            time.sleep(QUERY_DELAY)
 
 
 def _build_initial_windows(
@@ -360,9 +428,9 @@ def collect_all_apps(
             if count == 0:
                 print("no traffic", flush=True)
             elif not win_complete:
-                print(f"{count} entries  (capped → subdivided, incomplete)", flush=True)
+                print(f"{count} entries  (capped → incomplete)", flush=True)
             elif wins > 1:
-                print(f"{count} entries  (subdivided into {wins} queries)", flush=True)
+                print(f"{count} entries  ({wins} queries)", flush=True)
             else:
                 print(f"{count} entries", flush=True)
 
