@@ -74,7 +74,7 @@ POLL_TIMEOUT         = 120  # seconds before giving up on a single job
 HTTP_TIMEOUT         = 90   # seconds for each HTTP request (increase if Panorama is slow)
 INITIAL_WINDOW_HOURS = 24
 MIN_WINDOW_HOURS     = 1
-MAX_QUERIES_PER_RULE = 50   # cap per rule to avoid exhausting Panorama's job queue
+MAX_QUERIES_PER_RULE = 150  # cap per rule to avoid exhausting Panorama's job queue
 QUERY_DELAY          = 0    # extra seconds to sleep between query submissions
 
 VERBOSE  = False  # set from --verbose flag at startup
@@ -617,8 +617,8 @@ def _process_rule(
     )
     if not complete:
         lines.append(
-            f"  ! one or more windows hit the {MAX_LOGS}-entry cap at "
-            f"min window size — app list may be incomplete"
+            f"  ! query budget exhausted ({windows_queried} queries used) — "
+            f"raise --max-queries-per-rule to allow app-exclusion to finish"
         )
 
     row = {
