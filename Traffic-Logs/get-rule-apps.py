@@ -2,8 +2,8 @@
 get-rule-apps.py — identify distinct applications seen per security rule
 
 For each rule in the input file, queries PAN-OS traffic logs across the
-available window using adaptive time-sliced pagination, collects all unique
-'app' values, and writes a summary CSV.
+full date range using iterative app-exclusion, collects all unique 'app'
+values, and writes a summary CSV.
 
 Each rule is written to the CSV immediately after it completes, so a crash
 or connection drop only loses the rule currently being queried.
@@ -26,27 +26,21 @@ Other options:
     --action allow|deny|drop|all          Filter by action (default: allow)
     --output PATH / -o PATH               Output CSV (default: rule-apps-YYYYMMDD-HHMMSS.csv)
     --resume                              Skip rules already present in the output file
-    --skip-unused                       Skip rules with no hits since the query window
+    --skip-unused                         Skip rules with no hits since the query window
                                           start (uses the hit-count API — one call for all
                                           rules before querying begins)
-    --window-hours N                      Initial query window in hours (default: 24)
-    --min-window-hours N                  Minimum subdivision window in hours (default: 1)
-    --device-group NAME / --dg NAME        Override the device group used to fetch rule
+    --device-group NAME / --dg NAME       Override the device group used to fetch rule
                                           service config and hit counts (Panorama mode only;
                                           overrides DEVICE_GROUP in ops_lib.py for this run)
-    --verbose / -v                        Show per-window detail, job IDs, and polling dots
-
-Resume after interruption:
-    Always specify --output so the filename is known before the run starts.
-    If the run is interrupted, rerun with the same --output path and --resume.
-    Rules already written to the CSV are skipped; the script picks up where
-    it left off. The rule being queried when the crash happened is re-queried.
+    --max-queries-per-rule N              Max API queries per rule (default: 50)
+    --verbose / -v                        Show job IDs and polling dots
 
 Pagination:
-    Each rule's time range is sliced into --window-hours chunks. Any chunk
-    that returns the 5000-entry cap is recursively halved down to
-    --min-window-hours to avoid missing apps in busy windows.
-    Chunks still capped at the minimum window are flagged in the output.
+    Each rule queries the full date range. If the result is capped at 5000
+    entries, all found apps are excluded and the query re-runs to surface
+    the next layer of apps. This repeats until the result is empty or
+    uncapped. For most rules this completes in 2-5 queries regardless of
+    traffic volume.
 
 Before running: set MODE / VSYS / DEVICE_GROUP in ops_lib.py.
 """
@@ -64,7 +58,8 @@ from pathlib import Path
 import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "libs"))
-import ops_lib  # noqa: E402
+import ops_lib        # noqa: E402
+import log_query_lib  # noqa: E402
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 DAYS_BACK            = 7
@@ -72,9 +67,8 @@ MAX_LOGS             = 5000
 POLL_INTERVAL        = 3    # seconds between job-status polls
 POLL_TIMEOUT         = 120  # seconds before giving up on a single job
 HTTP_TIMEOUT         = 90   # seconds for each HTTP request (increase if Panorama is slow)
-INITIAL_WINDOW_HOURS = 24
-MIN_WINDOW_HOURS     = 1
-MAX_QUERIES_PER_RULE = 150  # cap per rule to avoid exhausting Panorama's job queue
+MAX_QUERIES_PER_RULE = 50   # cap per rule; most rules complete in < 10 rounds
+APP_COUNT_WARN       = 20   # warn when a rule has more distinct apps than this
 QUERY_DELAY          = 0    # extra seconds to sleep between query submissions
 
 VERBOSE  = False  # set from --verbose flag at startup
@@ -89,6 +83,8 @@ requests.packages.urllib3.disable_warnings()
 
 
 # ── API helpers ───────────────────────────────────────────────────────────────
+# Local _post for operational (non-log) API calls such as hit-count queries.
+# Log queries and pagination are handled by log_query_lib.
 
 def _post(params: dict) -> str:
     r = requests.post(
@@ -99,347 +95,6 @@ def _post(params: dict) -> str:
     )
     r.raise_for_status()
     return r.text
-
-
-def _build_query(
-    rule_name: str,
-    start_dt: datetime.datetime,
-    end_dt: datetime.datetime,
-    action: str,
-    exclude_apps: set[str] | None = None,
-) -> str:
-    start_str = start_dt.strftime("%Y/%m/%d %H:%M:%S")
-    end_str   = end_dt.strftime("%Y/%m/%d %H:%M:%S")
-    parts = [
-        f"(receive_time geq '{start_str}')",
-        f"(receive_time leq '{end_str}')",
-        f"(rule eq '{rule_name}')",
-    ]
-    if action != "all":
-        parts.append(f"(action eq '{action}')")
-    if exclude_apps:
-        for app in sorted(exclude_apps):
-            parts.append(f"(app neq '{app}')")
-    return " and ".join(parts)
-
-
-def _submit_job(query: str) -> str | None:
-    return _submit_job_n(query, MAX_LOGS)
-
-
-def _submit_job_n(query: str, nlogs: int) -> str | None:
-    params = {
-        "type":     "log",
-        "log-type": "traffic",
-        "query":    query,
-        "nlogs":    str(nlogs),
-        "dir":      "backward",
-        "key":      ops_lib.API_KEY,
-    }
-    xml_text = _post(params)
-    root = ET.fromstring(xml_text)
-    if root.get("status") != "success":
-        return None
-    return root.findtext(".//job")
-
-
-def _poll_job(job_id: str) -> str | None:
-    deadline = time.monotonic() + POLL_TIMEOUT
-    params = {
-        "type":   "log",
-        "action": "get",
-        "job-id": job_id,
-        "key":    ops_lib.API_KEY,
-    }
-    while time.monotonic() < deadline:
-        xml_text = _post(params)
-        root = ET.fromstring(xml_text)
-        if root.findtext(".//status") == "FIN":
-            if VERBOSE:
-                print(" done", end="", flush=True)
-            return xml_text
-        if VERBOSE:
-            print(".", end="", flush=True)
-        time.sleep(POLL_INTERVAL)
-    if VERBOSE:
-        print(" TIMEOUT", end="", flush=True)
-    return None
-
-
-def _query_window(
-    rule_name: str,
-    start_dt: datetime.datetime,
-    end_dt: datetime.datetime,
-    action: str,
-    indent: int = 0,
-    exclude_apps: set[str] | None = None,
-) -> tuple[set[str], int, bool, bool]:
-    """
-    Query one time window. Returns (apps, entry_count, capped, ok).
-    ok=False means the query failed or timed out — treat as incomplete,
-    not genuine no-traffic.
-    """
-    pad = "  " * indent
-
-    if VERBOSE:
-        fmt = "%m-%d %H:%M"
-        excl = f"  excl:{len(exclude_apps)}" if exclude_apps else ""
-        print(
-            f"{pad}  [{start_dt.strftime(fmt)} – {end_dt.strftime(fmt)}]{excl}",
-            end="  ", flush=True,
-        )
-
-    try:
-        query  = _build_query(rule_name, start_dt, end_dt, action, exclude_apps)
-        job_id = _submit_job(query)
-        if job_id is None:
-            if VERBOSE:
-                print("submission failed", flush=True)
-            return set(), 0, False, False   # ok=False
-
-        if VERBOSE:
-            print(f"job:{job_id} polling", end="", flush=True)
-
-        result_xml = _poll_job(job_id)
-        if result_xml is None:
-            if VERBOSE:
-                print("  (timeout)", flush=True)
-            return set(), 0, False, False   # ok=False
-
-        root  = ET.fromstring(result_xml)
-        apps  = set()
-        count = 0
-        for entry in root.iter("entry"):
-            app = entry.findtext("app") or ""
-            if app:
-                apps.add(app)
-            count += 1
-
-        capped = count >= MAX_LOGS
-
-        if VERBOSE:
-            cap_note = "  *** CAPPED ***" if capped else ""
-            print(f"  ({count} entries){cap_note}", flush=True)
-
-        if QUERY_DELAY > 0:
-            time.sleep(QUERY_DELAY)
-
-        return apps, count, capped, True    # ok=True
-
-    except Exception as exc:
-        if VERBOSE:
-            print(f"  error: {exc}", flush=True)
-        else:
-            fmt = "%b %d %H:%M"
-            print(
-                f"  error [{start_dt.strftime(fmt)}–{end_dt.strftime(fmt)}]: {exc}",
-                flush=True,
-            )
-        return set(), 0, False, False   # ok=False
-
-
-# ── Adaptive pagination ───────────────────────────────────────────────────────
-
-def _collect_window(
-    rule_name: str,
-    start_dt: datetime.datetime,
-    end_dt: datetime.datetime,
-    action: str,
-    min_hours: float,
-    indent: int = 0,
-    budget: list[int] | None = None,
-) -> tuple[set[str], int, bool, int]:
-    """
-    Recursively collect apps for [start_dt, end_dt].
-    Halves the window on a cap until min_hours is reached, then switches to
-    app-exclusion iteration to guarantee completeness without further subdivision.
-
-    budget is a one-element list used as a shared mutable counter across all
-    recursive calls for a single rule. When it reaches 0, no further queries
-    are issued and the remaining work is marked incomplete.
-
-    Returns (apps, entries_scanned, complete, windows_queried).
-    """
-    if budget is not None and budget[0] <= 0:
-        return set(), 0, False, 0
-
-    apps, count, capped, ok = _query_window(rule_name, start_dt, end_dt, action, indent)
-
-    if budget is not None:
-        budget[0] -= 1
-
-    if not ok:
-        return apps, count, False, 1   # error/timeout — mark incomplete
-
-    window_hours = (end_dt - start_dt).total_seconds() / 3600
-
-    if capped and window_hours > min_hours:
-        if budget is not None and budget[0] <= 0:
-            # Budget exhausted mid-subdivision — mark incomplete but keep what we have.
-            return apps, count, False, 1
-
-        if VERBOSE:
-            pad = "  " * indent
-            print(f"{pad}    subdividing...", flush=True)
-        mid = start_dt + (end_dt - start_dt) / 2
-        apps_l, count_l, complete_l, wins_l = _collect_window(
-            rule_name, start_dt, mid, action, min_hours, indent + 1, budget
-        )
-        apps_r, count_r, complete_r, wins_r = _collect_window(
-            rule_name, mid, end_dt, action, min_hours, indent + 1, budget
-        )
-        return (
-            apps_l | apps_r,
-            count_l + count_r,
-            complete_l and complete_r,
-            wins_l + wins_r,
-        )
-
-    if capped:
-        # capped at minimum window — switch to app-exclusion to finish this window
-        if VERBOSE:
-            pad = "  " * indent
-            print(f"{pad}    app-exclusion ...", flush=True)
-        extra_apps, extra_count, exhaust_complete, exhaust_wins = _exhaust_apps_in_window(
-            rule_name, start_dt, end_dt, action, apps,
-            indent=indent + 1 if VERBOSE else 0,
-            budget=budget,
-        )
-        return apps | extra_apps, count + extra_count, exhaust_complete, 1 + exhaust_wins
-
-    return apps, count, True, 1
-
-
-def _exhaust_apps_in_window(
-    rule_name: str,
-    start_dt: datetime.datetime,
-    end_dt: datetime.datetime,
-    action: str,
-    known_apps: set[str],
-    indent: int = 0,
-    budget: list[int] | None = None,
-) -> tuple[set[str], int, bool, int]:
-    """
-    App-exclusion iteration within a single fixed time window.
-    Used after time-subdivision reaches min_hours and the window is still capped.
-
-    Repeatedly queries with all already-found apps excluded until the result
-    is either empty or uncapped, guaranteeing all distinct apps are found.
-
-    Returns (newly_found_apps, entries_scanned, complete, queries_used).
-    """
-    found    = set()
-    all_excl = set(known_apps)
-    total    = 0
-    queries  = 0
-
-    while True:
-        if budget is not None and budget[0] <= 0:
-            return found, total, False, queries
-
-        apps, count, capped, ok = _query_window(
-            rule_name, start_dt, end_dt, action, indent, exclude_apps=all_excl,
-        )
-
-        if budget is not None:
-            budget[0] -= 1
-        queries += 1
-
-        if not ok:
-            return found, total, False, queries
-
-        total    += count
-        found    |= apps
-        all_excl |= apps
-
-        if count == 0 or not capped:
-            return found, total, True, queries
-
-        if QUERY_DELAY > 0:
-            time.sleep(QUERY_DELAY)
-
-
-def _build_initial_windows(
-    start_dt: datetime.datetime,
-    end_dt: datetime.datetime,
-    initial_hours: float,
-) -> list[tuple[datetime.datetime, datetime.datetime]]:
-    windows = []
-    step    = datetime.timedelta(hours=initial_hours)
-    cursor  = start_dt
-    while cursor < end_dt:
-        windows.append((cursor, min(cursor + step, end_dt)))
-        cursor += step
-    return windows
-
-
-def collect_all_apps(
-    rule_name: str,
-    start_dt: datetime.datetime,
-    end_dt: datetime.datetime,
-    action: str,
-    initial_hours: float,
-    min_hours: float,
-    max_queries: int,
-) -> tuple[set[str], int, bool, int]:
-    """
-    Slice [start_dt, end_dt] into initial_hours windows, then recursively
-    subdivide any that are capped.  Total API calls across all windows for
-    this rule are capped at max_queries.
-
-    Returns (apps, entries_scanned, complete, windows_queried).
-    """
-    windows    = _build_initial_windows(start_dt, end_dt, initial_hours)
-    all_apps   = set()
-    total      = 0
-    complete   = True
-    total_wins = 0
-    budget     = [max_queries]   # shared mutable counter across all windows
-
-    for w_idx, (win_start, win_end) in enumerate(windows, 1):
-        if budget[0] <= 0:
-            if not PARALLEL:
-                print(
-                    f"  range {w_idx:2}/{len(windows)}  "
-                    f"(query limit reached — {len(windows) - w_idx + 1} range(s) skipped)",
-                    flush=True,
-                )
-            complete = False
-            break
-
-        if not PARALLEL:
-            if VERBOSE:
-                print(f"  range {w_idx:2}/{len(windows)}", end="  ", flush=True)
-            else:
-                fmt = "%b %d"
-                print(
-                    f"  range {w_idx:2}/{len(windows)}  "
-                    f"({win_start.strftime(fmt)}–{win_end.strftime(fmt)}) ...",
-                    end="  ", flush=True,
-                )
-
-        apps, count, win_complete, wins = _collect_window(
-            rule_name, win_start, win_end, action, min_hours,
-            indent=1 if VERBOSE else 0,
-            budget=budget,
-        )
-
-        if not PARALLEL and not VERBOSE:
-            if count == 0:
-                print("no traffic", flush=True)
-            elif not win_complete:
-                print(f"{count} entries  (capped → incomplete)", flush=True)
-            elif wins > 1:
-                print(f"{count} entries  ({wins} queries)", flush=True)
-            else:
-                print(f"{count} entries", flush=True)
-
-        all_apps   |= apps
-        total      += count
-        complete    = complete and win_complete
-        total_wins += wins
-
-    return all_apps, total, complete, total_wins
 
 
 # ── Activity checks ───────────────────────────────────────────────────────────
@@ -501,16 +156,14 @@ def precheck_has_traffic(
     so the rule is queried rather than silently skipped.
     """
     try:
-        query  = _build_query(rule_name, start_dt, end_dt, action)
-        job_id = _submit_job_n(query, 1)
-        if job_id is None:
-            return True
-        result_xml = _poll_job(job_id)
-        if result_xml is None:
-            return True  # timeout — assume active
-        root = ET.fromstring(result_xml)
-        return any(True for _ in root.iter("entry"))
-
+        _, _, count, _, ok = log_query_lib.query_window(
+            rule_name, start_dt, end_dt, action,
+            max_logs=1,
+            poll_interval=POLL_INTERVAL,
+            poll_timeout=POLL_TIMEOUT,
+            http_timeout=HTTP_TIMEOUT,
+        )
+        return True if not ok else count > 0
     except Exception:
         return True
 
@@ -568,17 +221,15 @@ def fetch_rule_services(rule_names: list[str]) -> dict[str, list[str]]:
 # ── Parallel worker ───────────────────────────────────────────────────────────
 
 def _process_rule(
-    rule_name:        str,
-    rule_index:       int,
-    total_rules:      int,
-    start_dt:         datetime.datetime,
-    end_dt:           datetime.datetime,
-    action:           str,
-    window_hours:     float,
-    min_window_hours: float,
-    max_queries:      int,
-    use_precheck:     bool,
-    services_map:     dict[str, list[str]],
+    rule_name:    str,
+    rule_index:   int,
+    total_rules:  int,
+    start_dt:     datetime.datetime,
+    end_dt:       datetime.datetime,
+    action:       str,
+    max_queries:  int,
+    use_precheck: bool,
+    services_map: dict[str, list[str]],
 ) -> tuple[dict, str]:
     """
     Process one rule in a worker thread.
@@ -605,20 +256,32 @@ def _process_rule(
             return row, "\n".join(lines)
         lines[-1] += "  traffic found — querying"
 
-    all_apps, total_entries, complete, windows_queried = collect_all_apps(
-        rule_name, start_dt, end_dt,
-        action, window_hours, min_window_hours, max_queries,
+    all_apps, total_entries, complete, queries_used = log_query_lib.collect_apps(
+        rule_name, start_dt, end_dt, action,
+        max_queries  = max_queries,
+        max_logs     = MAX_LOGS,
+        poll_interval= POLL_INTERVAL,
+        poll_timeout = POLL_TIMEOUT,
+        http_timeout = HTTP_TIMEOUT,
+        verbose      = VERBOSE,
+        parallel     = PARALLEL,
+        query_delay  = QUERY_DELAY,
     )
 
     flag = " !" if not complete else ""
     lines.append(
         f"  → {len(all_apps)} apps | {total_entries} entries | "
-        f"{windows_queried} quer{'y' if windows_queried == 1 else 'ies'}{flag}"
+        f"{queries_used} quer{'y' if queries_used == 1 else 'ies'}{flag}"
     )
     if not complete:
         lines.append(
-            f"  ! query budget exhausted ({windows_queried} queries used) — "
+            f"  ! query budget exhausted ({queries_used} queries used) — "
             f"raise --max-queries-per-rule to allow app-exclusion to finish"
+        )
+    if len(all_apps) > APP_COUNT_WARN:
+        lines.append(
+            f"  ! {len(all_apps)} apps found (>{APP_COUNT_WARN}) — "
+            f"review this rule before splitting"
         )
 
     row = {
@@ -628,7 +291,7 @@ def _process_rule(
         "port_count":      len(services),
         "ports":           "|".join(services),
         "entries_scanned": total_entries,
-        "windows_queried": windows_queried,
+        "windows_queried": queries_used,
         "complete":        "yes" if complete else "no",
     }
     return row, "\n".join(lines)
@@ -681,14 +344,6 @@ def main() -> None:
     parser.add_argument(
         "--resume", action="store_true",
         help="Skip rules already present in the output file and append new results",
-    )
-    parser.add_argument(
-        "--window-hours", type=float, default=INITIAL_WINDOW_HOURS, metavar="N",
-        help=f"Initial query window in hours (default: {INITIAL_WINDOW_HOURS})",
-    )
-    parser.add_argument(
-        "--min-window-hours", type=float, default=MIN_WINDOW_HOURS, metavar="N",
-        help=f"Minimum subdivision window in hours (default: {MIN_WINDOW_HOURS})",
     )
     parser.add_argument(
         "--skip-unused", action="store_true",
@@ -779,7 +434,6 @@ def main() -> None:
     print(f"  From        : {start_dt.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"  To          : {end_dt.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"  Action      : {args.action}")
-    print(f"  Window      : {args.window_hours}h initial / {args.min_window_hours}h minimum")
     print(f"  Query cap   : {args.max_queries_per_rule} per rule")
     print(f"  Workers     : {args.workers}")
     inactive_mode = "hit-count API" if not args.debug_hitcount else "hit-count API (debug)"
@@ -847,14 +501,12 @@ def main() -> None:
 
     # Worker kwargs shared across all rule submissions
     worker_kwargs = dict(
-        start_dt         = start_dt,
-        end_dt           = end_dt,
-        action           = args.action,
-        window_hours     = args.window_hours,
-        min_window_hours = args.min_window_hours,
-        max_queries      = args.max_queries_per_rule,
-        use_precheck     = use_precheck,
-        services_map     = services_map,
+        start_dt     = start_dt,
+        end_dt       = end_dt,
+        action       = args.action,
+        max_queries  = args.max_queries_per_rule,
+        use_precheck = use_precheck,
+        services_map = services_map,
     )
 
     def _write_row(writer, fh, row: dict) -> None:
