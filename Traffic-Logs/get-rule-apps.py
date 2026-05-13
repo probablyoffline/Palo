@@ -25,7 +25,7 @@ Time period (choose one):
 Other options:
     --action allow|deny|drop|all          Filter by action (default: allow)
     --output PATH / -o PATH               Output CSV (default: rule-apps-YYYYMMDD-HHMMSS.csv)
-    --resume                              Skip rules already present in the output file
+    --resume                              Skip complete/skipped rules; re-query incomplete ones
     --skip-unused                         Skip rules with no hits since the query window
                                           start (uses the hit-count API — one call for all
                                           rules before querying begins)
@@ -170,15 +170,32 @@ def precheck_has_traffic(
 
 # ── Resume helpers ────────────────────────────────────────────────────────────
 
+def _strip_incomplete_rows(output_path: str, fieldnames: list[str]) -> None:
+    """Remove complete=no rows from an existing CSV in place."""
+    p = Path(output_path)
+    if not p.exists():
+        return
+    with open(p, newline="", encoding="utf-8") as fh:
+        rows = [r for r in csv.DictReader(fh) if r.get("complete") != "no"]
+    with open(p, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
 def load_completed_rules(output_path: str) -> set[str]:
-    """Return the set of rule names already written to an existing output CSV."""
+    """
+    Return the set of rule names that are already done and should be skipped.
+    Includes rules with complete=yes or complete=skipped.
+    Rules with complete=no are excluded so they get re-queried on resume.
+    """
     p = Path(output_path)
     if not p.exists():
         return set()
     completed = set()
     with open(p, newline="", encoding="utf-8") as fh:
         for row in csv.DictReader(fh):
-            if "rule" in row:
+            if "rule" in row and row.get("complete") != "no":
                 completed.add(row["rule"])
     return completed
 
@@ -343,7 +360,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--resume", action="store_true",
-        help="Skip rules already present in the output file and append new results",
+        help="Skip rules already complete/skipped in the output file; re-query incomplete ones",
     )
     parser.add_argument(
         "--skip-unused", action="store_true",
@@ -420,12 +437,16 @@ def main() -> None:
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
     # Determine which rules are already done (resume mode).
+    # complete=no rows are excluded from completed_rules so they get re-queried.
+    # Any existing incomplete rows are stripped from the CSV before appending
+    # so they don't produce duplicate entries.
     completed_rules: set[str] = set()
     if args.resume:
         completed_rules = load_completed_rules(output_path)
+        _strip_incomplete_rows(output_path, CSV_FIELDNAMES)
 
     remaining = [r for r in rule_names if r not in completed_rules]
-    file_mode = "a" if (args.resume and completed_rules) else "w"
+    file_mode = "a" if (args.resume and Path(output_path).exists()) else "w"
 
     print("=" * 62)
     print("  get-rule-apps")
@@ -440,8 +461,21 @@ def main() -> None:
     print(f"  Rules       : {len(rule_names)} total / {len(remaining)} to query")
     if args.skip_unused:
         print(f"  Inactive    : will skip via {inactive_mode} (with precheck fallback)")
-    if completed_rules:
-        print(f"  Resuming    : {len(completed_rules)} already complete, skipping")
+    if args.resume and Path(output_path).exists():
+        all_in_csv = set()
+        incomplete_in_csv = set()
+        if Path(output_path).exists():
+            with open(output_path, newline="", encoding="utf-8") as _fh:
+                for _row in csv.DictReader(_fh):
+                    if "rule" in _row:
+                        all_in_csv.add(_row["rule"])
+                        if _row.get("complete") == "no":
+                            incomplete_in_csv.add(_row["rule"])
+        if completed_rules or incomplete_in_csv:
+            print(
+                f"  Resuming    : {len(completed_rules)} skipped"
+                + (f", {len(incomplete_in_csv)} incomplete — re-querying" if incomplete_in_csv else "")
+            )
     print(f"  Output      : {output_path}  ({file_mode})")
     print()
 
@@ -527,7 +561,7 @@ def main() -> None:
                 total = len(rule_names)
 
                 if rule_name in completed_rules:
-                    print(f"[{i}/{total}] {rule_name}  (skipped — already complete)")
+                    print(f"[{i}/{total}] {rule_name}  (skipped — already done)")
                     continue
 
                 if active_rules is not None and rule_name not in active_rules:
