@@ -291,10 +291,16 @@ def _process_rule(
         f"{queries_used} quer{'y' if queries_used == 1 else 'ies'}{flag}"
     )
     if not complete:
-        lines.append(
-            f"  ! query budget exhausted ({queries_used} queries used) — "
-            f"raise --max-queries-per-rule to allow app-exclusion to finish"
-        )
+        if queries_used >= max_queries:
+            lines.append(
+                f"  ! query budget exhausted ({queries_used} queries used) — "
+                f"raise --max-queries-per-rule to allow app-exclusion to finish"
+            )
+        else:
+            lines.append(
+                f"  ! query failed on round {queries_used} — "
+                f"re-run with --resume to retry (may be a transient Panorama error)"
+            )
     if len(all_apps) > APP_COUNT_WARN:
         lines.append(
             f"  ! {len(all_apps)} apps found (>{APP_COUNT_WARN}) — "
