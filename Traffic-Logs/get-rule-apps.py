@@ -33,6 +33,7 @@ Other options:
                                           service config and hit counts (Panorama mode only;
                                           overrides DEVICE_GROUP in ops_lib.py for this run)
     --max-queries-per-rule N              Max API queries per rule (default: 50)
+    --poll-timeout SECS                   Seconds to wait per log job (default: 120)
     --verbose / -v                        Show job IDs and polling dots
 
 Pagination:
@@ -336,7 +337,7 @@ def _parse_datetime(s: str) -> datetime.datetime:
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    global VERBOSE, PARALLEL, QUERY_DELAY
+    global VERBOSE, PARALLEL, QUERY_DELAY, POLL_TIMEOUT
 
     parser = argparse.ArgumentParser(
         description="Identify distinct applications per security rule from PAN-OS traffic logs."
@@ -377,6 +378,10 @@ def main() -> None:
         help=f"Max API queries per rule before marking incomplete (default: {MAX_QUERIES_PER_RULE})",
     )
     parser.add_argument(
+        "--poll-timeout", type=int, default=POLL_TIMEOUT, metavar="SECS",
+        help=f"Seconds to wait for a log job to finish before timing out (default: {POLL_TIMEOUT})",
+    )
+    parser.add_argument(
         "--query-delay", type=float, default=QUERY_DELAY, metavar="SECS",
         help="Extra seconds to sleep between query submissions (default: 0)",
     )
@@ -411,9 +416,10 @@ def main() -> None:
         ops_lib.DEVICE_GROUP = args.device_group
         ops_lib.MODE = "panorama"
 
-    VERBOSE     = args.verbose
-    PARALLEL    = args.workers > 1
-    QUERY_DELAY = args.query_delay
+    VERBOSE      = args.verbose
+    PARALLEL     = args.workers > 1
+    QUERY_DELAY  = args.query_delay
+    POLL_TIMEOUT = args.poll_timeout
 
     if VERBOSE and PARALLEL:
         print("Note: --verbose is ignored when --workers > 1", flush=True)
@@ -462,6 +468,7 @@ def main() -> None:
     print(f"  To          : {end_dt.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"  Action      : {args.action}")
     print(f"  Query cap   : {args.max_queries_per_rule} per rule")
+    print(f"  Poll timeout: {POLL_TIMEOUT}s per job")
     print(f"  Workers     : {args.workers}")
     inactive_mode = "hit-count API" if not args.debug_hitcount else "hit-count API (debug)"
     print(f"  Rules       : {len(rule_names)} total / {len(remaining)} to query")
