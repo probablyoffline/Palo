@@ -275,7 +275,8 @@ def fetch_rule_app_stats(debug_path: str | None = None) -> dict[str, dict[str, i
         root = ET.fromstring(xml_text)
         if root.get("status") != "success":
             msg = root.findtext(".//msg") or "unknown error"
-            print(f"  Warning: rule app stats API returned error: {msg}", flush=True)
+            print(f"not supported on this PAN-OS version ({msg})", flush=True)
+            print(f"  Falling back to log queries for all rules. Use --no-stats to suppress this message.", flush=True)
             return None
 
         result: dict[str, dict[str, int]] = {}
@@ -300,7 +301,8 @@ def fetch_rule_app_stats(debug_path: str | None = None) -> dict[str, dict[str, i
         return result if result else None
 
     except Exception as exc:
-        print(f"  Warning: could not fetch rule app stats: {exc}", flush=True)
+        print(f"not supported on this PAN-OS version ({exc})", flush=True)
+        print(f"  Falling back to log queries for all rules. Use --no-stats to suppress this message.", flush=True)
         return None
 
 
@@ -821,13 +823,20 @@ def main() -> None:
 
     summary_lines = [
         "=" * 62,
-        "  Done.",
-        f"  Elapsed          : {elapsed_str}",
+        f"  get-rule-apps  v{VERSION}",
+        "=" * 62,
         f"  Target           : {ops_lib.TARGET_HOST}  ({ops_lib.mode_summary()})",
         f"  Input            : {args.input_file}",
         f"  From             : {start_dt.strftime('%Y-%m-%d %H:%M:%S')}",
         f"  To               : {end_dt.strftime('%Y-%m-%d %H:%M:%S')}",
         f"  Action           : {args.action}",
+        f"  Query cap        : {args.max_queries_per_rule} per rule",
+        f"  Poll timeout     : {POLL_TIMEOUT}s per job",
+        f"  Workers          : {args.workers}",
+        f"  Stats window     : {'disabled (--no-stats)' if args.no_stats else f'{args.stats_window} months'}",
+        "-" * 62,
+        "  Done.",
+        f"  Elapsed          : {elapsed_str}",
         "-" * 62,
         f"  Rules queried    : {rules_queried}",
     ]
