@@ -66,6 +66,8 @@ import ops_lib        # noqa: E402
 import log_query_lib  # noqa: E402
 
 # ── Configuration ─────────────────────────────────────────────────────────────
+VERSION              = "1.5.0"
+
 DAYS_BACK            = 7
 MAX_LOGS             = 5000
 POLL_INTERVAL        = 3    # seconds between job-status polls
@@ -590,7 +592,7 @@ def main() -> None:
     file_mode = "a" if (args.resume and Path(output_path).exists()) else "w"
 
     print("=" * 62)
-    print("  get-rule-apps")
+    print(f"  get-rule-apps  v{VERSION}")
     print("=" * 62)
     print(f"  Target      : {ops_lib.TARGET_HOST}  ({ops_lib.mode_summary()})")
     print(f"  From        : {start_dt.strftime('%Y-%m-%d %H:%M:%S')}")
