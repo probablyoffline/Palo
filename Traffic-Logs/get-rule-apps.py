@@ -34,6 +34,9 @@ Other options:
                                           overrides DEVICE_GROUP in ops_lib.py for this run)
     --max-queries-per-rule N              Max API queries per rule (default: 50)
     --poll-timeout SECS                   Seconds to wait per log job (default: 120)
+    --stats-window MONTHS                 App stats lookback window in months (default: 13)
+    --no-stats                            Skip rule stats; always query traffic logs
+    --debug-rule-stats PATH               Write raw rule app stats response to PATH
     --verbose / -v                        Show job IDs and polling dots
 
 Pagination:
@@ -78,7 +81,7 @@ PARALLEL = False  # set to True when workers > 1; suppresses per-window prints
 _print_lock = threading.Lock()
 _csv_lock   = threading.Lock()
 
-CSV_FIELDNAMES = ["rule", "app_count", "apps", "port_count", "ports", "entries_scanned", "windows_queried", "complete"]
+CSV_FIELDNAMES = ["rule", "app_count", "apps", "port_count", "ports", "entries_scanned", "windows_queried", "complete", "data_source"]
 
 requests.packages.urllib3.disable_warnings()
 
@@ -236,26 +239,138 @@ def fetch_rule_services(rule_names: list[str]) -> dict[str, list[str]]:
     return result
 
 
+# ── Rule app stats ────────────────────────────────────────────────────────────
+
+def fetch_rule_app_stats(debug_path: str | None = None) -> dict[str, dict[str, int]] | None:
+    """
+    Fetch per-rule, per-app last-hit timestamps via the operational API.
+    Returns {rule_name: {app_name: last_hit_epoch}} or None if unavailable.
+    The caller filters apps by their own time window.
+    """
+    if ops_lib.MODE == "panorama":
+        rb_tag = f"{ops_lib.RULEBASE}-rulebase"
+        cmd = (
+            f"<show><rule-use><application><device-group>"
+            f"<entry name='{ops_lib.DEVICE_GROUP}'>"
+            f"<{rb_tag}><security><rules><all/></rules></security></{rb_tag}>"
+            f"</entry></device-group></application></rule-use></show>"
+        )
+    else:
+        cmd = (
+            f"<show><rule-use><application><vsys>"
+            f"<entry name='{ops_lib.VSYS}'>"
+            f"<rulebase><security><rules><all/></rules></security></rulebase>"
+            f"</entry></vsys></application></rule-use></show>"
+        )
+
+    try:
+        xml_text = _post({"type": "op", "cmd": cmd, "key": ops_lib.API_KEY})
+
+        if debug_path:
+            with open(debug_path, "w", encoding="utf-8") as fh:
+                fh.write(xml_text)
+
+        root = ET.fromstring(xml_text)
+        if root.get("status") != "success":
+            msg = root.findtext(".//msg") or "unknown error"
+            print(f"  Warning: rule app stats API returned error: {msg}", flush=True)
+            return None
+
+        result: dict[str, dict[str, int]] = {}
+        for rule_entry in root.findall(".//rules/entry"):
+            rule_name = rule_entry.get("name", "")
+            if not rule_name:
+                continue
+            apps: dict[str, int] = {}
+            for app_entry in rule_entry.findall(".//entry"):
+                app_name = app_entry.get("name", "")
+                if not app_name:
+                    continue
+                ts_el = app_entry.find("last-hit-timestamp")
+                if ts_el is not None:
+                    try:
+                        apps[app_name] = int(ts_el.text or "0")
+                    except ValueError:
+                        apps[app_name] = 0
+            if apps:
+                result[rule_name] = apps
+
+        return result if result else None
+
+    except Exception as exc:
+        print(f"  Warning: could not fetch rule app stats: {exc}", flush=True)
+        return None
+
+
 # ── Parallel worker ───────────────────────────────────────────────────────────
 
 def _process_rule(
-    rule_name:    str,
-    rule_index:   int,
-    total_rules:  int,
-    start_dt:     datetime.datetime,
-    end_dt:       datetime.datetime,
-    action:       str,
-    max_queries:  int,
-    use_precheck: bool,
-    services_map: dict[str, list[str]],
+    rule_name:      str,
+    rule_index:     int,
+    total_rules:    int,
+    start_dt:       datetime.datetime,
+    end_dt:         datetime.datetime,
+    action:         str,
+    max_queries:    int,
+    use_precheck:   bool,
+    services_map:   dict[str, list[str]],
+    rule_stats:     dict[str, int] | None,
+    oldest_log_dt:  datetime.datetime | None,
+    stats_cutoff_dt: datetime.datetime,
 ) -> tuple[dict, str]:
     """
     Process one rule in a worker thread.
     Returns (csv_row, console_output_block).
+
+    If rule_stats and oldest_log_dt are both available, uses stats when the
+    rule's most recent app activity predates the log window; otherwise queries
+    traffic logs via app-exclusion.
     """
     lines: list[str] = [f"[{rule_index}/{total_rules}] {rule_name}"]
     services = services_map.get(rule_name, [])
 
+    # ── Decide data source ────────────────────────────────────────────────────
+    use_stats  = False
+    stats_apps: set[str] = set()
+
+    if rule_stats is not None and oldest_log_dt is not None:
+        cutoff_epoch   = int(stats_cutoff_dt.timestamp())
+        max_last_seen  = max(rule_stats.values()) if rule_stats else 0
+        max_last_seen_dt = (
+            datetime.datetime.fromtimestamp(max_last_seen) if max_last_seen else None
+        )
+        if max_last_seen_dt is None or max_last_seen_dt < oldest_log_dt:
+            use_stats  = True
+            stats_apps = {
+                app for app, ts in rule_stats.items()
+                if ts >= cutoff_epoch and app
+            }
+
+    # ── Stats path ────────────────────────────────────────────────────────────
+    if use_stats:
+        lines.append(
+            f"  → {len(stats_apps)} apps | from rule stats "
+            f"(last activity predates log window)"
+        )
+        if len(stats_apps) > APP_COUNT_WARN:
+            lines.append(
+                f"  ! {len(stats_apps)} apps found (>{APP_COUNT_WARN}) — "
+                f"review this rule before splitting"
+            )
+        row = {
+            "rule":            rule_name,
+            "app_count":       len(stats_apps),
+            "apps":            "|".join(sorted(stats_apps)),
+            "port_count":      len(services),
+            "ports":           "|".join(services),
+            "entries_scanned": 0,
+            "windows_queried": 0,
+            "complete":        "yes",
+            "data_source":     "stats",
+        }
+        return row, "\n".join(lines)
+
+    # ── Log query path ────────────────────────────────────────────────────────
     if use_precheck:
         lines.append("  precheck ...")
         has_traffic = precheck_has_traffic(rule_name, start_dt, end_dt, action)
@@ -270,6 +385,7 @@ def _process_rule(
                 "entries_scanned": 0,
                 "windows_queried": 1,
                 "complete":        "skipped",
+                "data_source":     "",
             }
             return row, "\n".join(lines)
         lines[-1] += "  traffic found — querying"
@@ -317,6 +433,7 @@ def _process_rule(
         "entries_scanned": total_entries,
         "windows_queried": queries_used,
         "complete":        "yes" if complete else "no",
+        "data_source":     "logs",
     }
     return row, "\n".join(lines)
 
@@ -388,6 +505,18 @@ def main() -> None:
     parser.add_argument(
         "--debug-hitcount", metavar="PATH",
         help="Write the raw hit-count API response to PATH for inspection (implies --skip-unused)",
+    )
+    parser.add_argument(
+        "--stats-window", type=int, default=13, metavar="MONTHS",
+        help="When using rule stats, only include apps seen within this many months (default: 13)",
+    )
+    parser.add_argument(
+        "--no-stats", action="store_true",
+        help="Skip rule stats lookup entirely; always query traffic logs",
+    )
+    parser.add_argument(
+        "--debug-rule-stats", metavar="PATH",
+        help="Write the raw rule app stats API response to PATH for inspection",
     )
     parser.add_argument(
         "--workers", type=int, default=2, metavar="N",
@@ -541,6 +670,36 @@ def main() -> None:
             use_precheck = True
         print()
 
+    # ── Rule app stats + oldest log timestamp ────────────────────────────────
+    all_rule_stats: dict[str, dict[str, int]] | None = None
+    oldest_log_dt:  datetime.datetime | None         = None
+    stats_cutoff_dt = run_dt - datetime.timedelta(days=30 * args.stats_window)
+
+    if not args.no_stats:
+        print("  Fetching rule app stats ...", end=" ", flush=True)
+        all_rule_stats = fetch_rule_app_stats(
+            debug_path=args.debug_rule_stats or None
+        )
+        if args.debug_rule_stats:
+            print(f"\n  Raw response written to: {args.debug_rule_stats}")
+            print("  Fetching rule app stats ...", end=" ", flush=True)
+
+        if all_rule_stats:
+            print(f"{len(all_rule_stats)} rules with app data", flush=True)
+            print("  Fetching oldest log timestamp ...", end=" ", flush=True)
+            oldest_log_dt = log_query_lib.fetch_oldest_log_dt(
+                poll_timeout=POLL_TIMEOUT,
+                http_timeout=HTTP_TIMEOUT,
+            )
+            if oldest_log_dt:
+                print(f"{oldest_log_dt.strftime('%Y-%m-%d')}", flush=True)
+            else:
+                print("unavailable — will use log queries for all rules", flush=True)
+                all_rule_stats = None
+        else:
+            print("unavailable — will use log queries for all rules", flush=True)
+        print()
+
     run_results: list[dict] = []
     run_start = datetime.datetime.now()
     consecutive_no_traffic = 0
@@ -548,12 +707,14 @@ def main() -> None:
 
     # Worker kwargs shared across all rule submissions
     worker_kwargs = dict(
-        start_dt     = start_dt,
-        end_dt       = end_dt,
-        action       = args.action,
-        max_queries  = args.max_queries_per_rule,
-        use_precheck = use_precheck,
-        services_map = services_map,
+        start_dt        = start_dt,
+        end_dt          = end_dt,
+        action          = args.action,
+        max_queries     = args.max_queries_per_rule,
+        use_precheck    = use_precheck,
+        services_map    = services_map,
+        oldest_log_dt   = oldest_log_dt,
+        stats_cutoff_dt = stats_cutoff_dt,
     )
 
     def _write_row(writer, fh, row: dict) -> None:
@@ -592,15 +753,18 @@ def main() -> None:
                         "entries_scanned": 0,
                         "windows_queried": 0,
                         "complete":        "skipped",
+                        "data_source":     "",
                     }
                     _write_row(writer, fh, row)
                     run_results.append(row)
                     continue
 
+                rule_stats = all_rule_stats.get(rule_name) if all_rule_stats else None
                 if PARALLEL:
                     print(f"[{i}/{total}] {rule_name}  → queuing...", flush=True)
                 future = pool.submit(
-                    _process_rule, rule_name, i, total, **worker_kwargs
+                    _process_rule, rule_name, i, total,
+                    **worker_kwargs, rule_stats=rule_stats,
                 )
                 future_to_index[future] = i
 
@@ -643,6 +807,8 @@ def main() -> None:
     rules_with       = sum(1 for r in run_results if r["app_count"] > 0)
     rules_none       = sum(1 for r in run_results if r["complete"] not in ("skipped",) and r["app_count"] == 0)
     rules_incomplete = sum(1 for r in run_results if r["complete"] == "no")
+    rules_from_stats = sum(1 for r in run_results if r.get("data_source") == "stats")
+    rules_from_logs  = sum(1 for r in run_results if r.get("data_source") == "logs")
     total_entries    = sum(r["entries_scanned"] for r in run_results)
 
     elapsed = datetime.datetime.now() - run_start
@@ -667,6 +833,11 @@ def main() -> None:
         summary_lines.append(f"  Rules resumed    : {len(completed_rules)}  (skipped — already complete)")
     if rules_skipped:
         summary_lines.append(f"  Rules inactive   : {rules_skipped}  (skipped — no hits in window)")
+    if oldest_log_dt:
+        summary_lines.append(f"  Log window start : {oldest_log_dt.strftime('%Y-%m-%d')}")
+    if rules_from_stats or rules_from_logs:
+        summary_lines.append(f"  From stats       : {rules_from_stats}")
+        summary_lines.append(f"  From logs        : {rules_from_logs}")
     summary_lines += [
         f"  With apps        : {rules_with}",
         f"  No traffic       : {rules_none}",
