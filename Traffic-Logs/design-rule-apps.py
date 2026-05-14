@@ -6,12 +6,23 @@ and outputs:
   - A .txt file: formatted text designs for documentation and approval
   - A .csv file: structured data for future scripted implementation
 
+Port standard determination (default — dynamic mode):
+  For each rule, the script queries Panorama's app-id database to get the official
+  standard port(s) for every observed application.  A rule's existing service config
+  is compared against the union of those standard ports:
+    - If all current ports are standard for the observed apps → new rule uses
+      application-default, no app-id-non-standard tag.
+    - If any port is not standard for any of the observed apps → new rule lists
+      all ports explicitly, app-id-non-standard tag added.
+  This reflects Palo Alto's own definition of what is standard — not a static list.
+
+  Use --static-ports to disable dynamic lookup and fall back to standard-ports.txt.
+  Dynamic lookup also falls back to standard-ports.txt automatically if the API
+  call fails.
+
 Config files (auto-read from the same directory as this script):
-  standard-ports.txt  — one port per line (e.g. tcp-80, tcp-443).
-                        If all explicit ports in a rule are on this list, the new
-                        rule uses application-default.  If the file is absent, all
-                        explicit port lists are treated as non-standard.
   risky-apps.txt      — one app name per line.  Matching apps add the risky-app tag.
+  standard-ports.txt  — fallback used when --static-ports is set or API is unavailable.
 
 Usage:
     python design-rule-apps.py <input_csv> [options]
@@ -19,6 +30,7 @@ Usage:
 Options:
     --device-group NAME / --dg NAME   Override device group (Panorama mode only)
     --output PATH / -o PATH           Output file stem (auto-named in Output/ if omitted)
+    --static-ports                    Skip dynamic app-id lookup; use standard-ports.txt
     --standard-ports FILE             Override the default standard-ports.txt path
     --risky-apps FILE                 Override the default risky-apps.txt path
     --no-csv                          Skip the structured CSV output, text only
@@ -69,6 +81,10 @@ TAG_RISKY        = "risky-app"
 TAG_UNDER_REVIEW = "app-id-under-review"
 TAG_UNUSED       = "app-id-review-unused"
 
+# Port ranges larger than this are not expanded; ports falling in them are treated
+# conservatively as non-standard (avoids huge sets for apps like ftp-data).
+MAX_RANGE_EXPAND = 100
+
 DESIGN_CSV_FIELDNAMES = [
     "type", "device_group", "rule_name", "clone_above",
     "description", "tags",
@@ -95,7 +111,7 @@ class RuleConfig:
     found:         bool      = True
 
 
-# ── Config file loaders ───────────────────────────────────────────────────────
+# ── Config file loader ────────────────────────────────────────────────────────
 
 def load_set_from_file(
     path: Path,
@@ -119,7 +135,7 @@ def load_set_from_file(
     return result
 
 
-# ── API helpers ───────────────────────────────────────────────────────────────
+# ── Rule config fetch ─────────────────────────────────────────────────────────
 
 def fetch_full_rule_configs(rule_names: list[str]) -> dict[str, RuleConfig]:
     """
@@ -181,6 +197,107 @@ def fetch_full_rule_configs(rule_names: list[str]) -> dict[str, RuleConfig]:
     return configs
 
 
+# ── App default port lookup ───────────────────────────────────────────────────
+
+def _parse_app_ports_to_set(entry: ET.Element) -> set[str]:
+    """
+    Extract default ports from a PAN-OS app entry element.
+    Converts 'tcp/80' → 'tcp-80'.  Expands ranges up to MAX_RANGE_EXPAND ports;
+    wider ranges are skipped (conservative — ports in that range stay non-standard).
+    """
+    result: set[str] = set()
+    default_el = entry.find("default")
+    if default_el is None:
+        return result
+    port_el = default_el.find("port")
+    if port_el is None:
+        return result
+
+    for member in port_el.findall("member"):
+        if not member.text or "/" not in member.text:
+            continue
+        proto, port_spec = member.text.strip().lower().split("/", 1)
+        if "-" in port_spec:
+            try:
+                start_n, end_n = (int(x) for x in port_spec.split("-", 1))
+                if end_n - start_n <= MAX_RANGE_EXPAND:
+                    for p in range(start_n, end_n + 1):
+                        result.add(f"{proto}-{p}")
+            except ValueError:
+                pass
+        else:
+            try:
+                int(port_spec)
+                result.add(f"{proto}-{port_spec}")
+            except ValueError:
+                pass
+
+    return result
+
+
+def fetch_app_default_ports(app_names: list[str]) -> tuple[dict[str, set[str]], bool]:
+    """
+    Query Panorama/firewall for the official standard ports of each application.
+
+    Checks, in order:
+      1. /config/predefined/application  — Palo Alto's built-in app-id database
+      2. /config/shared/application      — shared custom apps (Panorama only)
+      3. DG or vsys custom apps          — org-defined apps
+
+    Returns (port_map, api_available):
+      port_map:       {app_name: set of 'tcp-80' style strings}
+                      Empty set means the app has no defined default ports (e.g. ident-by-ip).
+      api_available:  True if at least one API source responded successfully.
+    """
+    wanted = {a for a in app_names
+              if a and a not in NON_APP_VALUES and a not in UNKNOWN_APP_VALUES}
+    if not wanted:
+        return {}, True
+
+    port_map: dict[str, set[str]] = {name: set() for name in wanted}
+    api_available = False
+
+    # Build a single XPath filter for all needed apps (one API call per source)
+    if len(wanted) == 1:
+        app_filter = f"@name='{next(iter(wanted))}'"
+    else:
+        app_filter = " or ".join(f"@name='{a}'" for a in sorted(wanted))
+
+    # Sources to query in order; last writer wins (custom apps can override predefined)
+    sources: list[str] = [f"/config/predefined/application/entry[{app_filter}]"]
+    if ops_lib.MODE == "panorama":
+        sources.append(f"/config/shared/application/entry[{app_filter}]")
+        sources.append(
+            f"/config/devices/entry[@name='localhost.localdomain']"
+            f"/device-group/entry[@name='{ops_lib.DEVICE_GROUP}']"
+            f"/application/entry[{app_filter}]"
+        )
+    else:
+        sources.append(
+            f"/config/devices/entry[@name='localhost.localdomain']"
+            f"/vsys/entry[@name='{ops_lib.VSYS}']/application/entry[{app_filter}]"
+        )
+
+    for xpath in sources:
+        try:
+            xml_text = ops_lib.api_get(xpath)
+            root = ET.fromstring(xml_text)
+        except Exception:
+            continue
+
+        if root.get("status") == "error":
+            continue
+
+        api_available = True
+        for entry in root.iter("entry"):
+            name = entry.get("name", "")
+            if name in wanted:
+                ports = _parse_app_ports_to_set(entry)
+                port_map[name] |= ports
+
+    return port_map, api_available
+
+
 # ── Port helpers ──────────────────────────────────────────────────────────────
 
 def determine_port_setting(
@@ -190,7 +307,12 @@ def determine_port_setting(
     """
     Returns (service_string, is_non_standard).
 
-    If all explicit ports are in standard_ports → ("application-default", False).
+    standard_ports is either:
+      - Dynamic mode: the union of Palo Alto's official default ports for all
+        observed apps in this rule.
+      - Static mode / fallback: the contents of standard-ports.txt.
+
+    If all explicit ports are covered by standard_ports → ("application-default", False).
     Otherwise → (pipe-separated port list, True).
     """
     if not ports_raw:
@@ -393,8 +515,12 @@ def main() -> None:
         help="Output file stem (.txt and .csv appended); default: Output/rule-design-<stem>-TIMESTAMP",
     )
     parser.add_argument(
+        "--static-ports", action="store_true",
+        help="Skip dynamic app-id lookup; use standard-ports.txt to classify ports instead",
+    )
+    parser.add_argument(
         "--standard-ports", metavar="FILE", dest="standard_ports_file",
-        help=f"Standard ports file (default: {STANDARD_PORTS_FILE.name} in script directory)",
+        help=f"Standard ports fallback file (default: {STANDARD_PORTS_FILE.name} in script directory)",
     )
     parser.add_argument(
         "--risky-apps", metavar="FILE", dest="risky_apps_file",
@@ -420,20 +546,27 @@ def main() -> None:
     txt_path = f"{output_stem}.txt"
     csv_path = f"{output_stem}.csv"
 
+    port_mode = "static (standard-ports.txt)" if args.static_ports else "dynamic (Panorama app-id database)"
+
     print("=" * 62)
     print("  design-rule-apps")
     print("=" * 62)
     print(f"  Input       : {args.input_csv}")
     print(f"  Target      : {ops_lib.TARGET_HOST}  ({ops_lib.mode_summary()})")
+    print(f"  Port mode   : {port_mode}")
     print(f"  Output .txt : {txt_path}")
     if not args.no_csv:
         print(f"  Output .csv : {csv_path}")
     print()
 
+    ra_path    = Path(args.risky_apps_file) if args.risky_apps_file else RISKY_APPS_FILE
+    risky_apps = load_set_from_file(ra_path, default=DEFAULT_RISKY_APPS, label="risky-apps")
+
     sp_path = Path(args.standard_ports_file) if args.standard_ports_file else STANDARD_PORTS_FILE
-    ra_path = Path(args.risky_apps_file)      if args.risky_apps_file      else RISKY_APPS_FILE
-    standard_ports = load_set_from_file(sp_path, default=None,             label="standard-ports")
-    risky_apps     = load_set_from_file(ra_path, default=DEFAULT_RISKY_APPS, label="risky-apps")
+    static_standard_ports: set[str] = set()
+    if args.static_ports:
+        static_standard_ports = load_set_from_file(sp_path, default=None, label="standard-ports")
+
     print()
 
     try:
@@ -453,12 +586,42 @@ def main() -> None:
     configs = fetch_full_rule_configs(rule_names)
     found   = sum(1 for c in configs.values() if c.found)
     print(f"{found}/{len(rule_names)} found")
+
+    # ── App default port lookup ───────────────────────────────────────────────
+    # app_port_map: app_name → set of 'tcp-80' style standard port strings
+    # dynamic_available: True  → use per-rule union of app default ports
+    #                    False → fall back to static_standard_ports
+    app_port_map: dict[str, set[str]] = {}
+    dynamic_available = False
+
+    if not args.static_ports:
+        all_usable: set[str] = set()
+        for row in rows:
+            usable, _, _ = classify_apps(row.get("apps", ""), risky_apps)
+            all_usable.update(usable)
+
+        if all_usable:
+            print(
+                f"  Fetching standard ports for {len(all_usable)} unique apps ...",
+                end=" ", flush=True,
+            )
+            app_port_map, dynamic_available = fetch_app_default_ports(list(all_usable))
+
+            if dynamic_available:
+                n_with_ports = sum(1 for v in app_port_map.values() if v)
+                print(f"{n_with_ports}/{len(all_usable)} apps have defined standard ports")
+            else:
+                print("API unavailable — falling back to standard-ports.txt")
+                static_standard_ports = load_set_from_file(
+                    sp_path, default=None, label="standard-ports"
+                )
+
     print()
 
     device_group   = ops_lib.DEVICE_GROUP
     designs: list[str] = []
     csv_rows: list[dict] = []
-    design_count = 0
+    design_count   = 0
     new_rule_count = 0
     unused_count   = 0
 
@@ -467,22 +630,19 @@ def main() -> None:
         if not rule_name:
             continue
 
-        complete = row.get("complete", "").strip().lower()
-        apps_raw = row.get("apps", "").strip()
+        complete  = row.get("complete", "").strip().lower()
+        apps_raw  = row.get("apps", "").strip()
         ports_raw = row.get("ports", "").strip()
-        config   = configs[rule_name]
+        config    = configs[rule_name]
 
         usable_apps, has_unknown, has_risky = classify_apps(apps_raw, risky_apps)
-
         has_no_apps = not usable_apps and not has_unknown
 
         if complete == "no" and has_no_apps:
-            # Query incomplete and no apps found — can't generate a design; needs re-run.
-            print(f"  Skipping {rule_name} — query was incomplete (complete=no) and no apps were found.")
-            print(f"    Re-run get-rule-apps.py with --resume to retry this rule.")
+            print(f"  Skipping {rule_name} — query incomplete (complete=no) with no apps found.")
+            print( "    Re-run get-rule-apps.py with --resume to retry this rule.")
             continue
 
-        # Skipped (no traffic) or queried with no identifiable apps → tag-update only
         if complete == "skipped" or has_no_apps:
             design_count += 1
             unused_count += 1
@@ -491,9 +651,16 @@ def main() -> None:
                 csv_rows.append(build_tag_update_row(rule_name, TAG_UNUSED, device_group))
             continue
 
-        service, is_non_standard = determine_port_setting(ports_raw, standard_ports)
+        # Determine standard ports for this rule's specific apps
+        if dynamic_available:
+            rule_std_ports: set[str] = set()
+            for app in usable_apps:
+                rule_std_ports |= app_port_map.get(app, set())
+        else:
+            rule_std_ports = static_standard_ports
 
-        # Build new rule tag list: existing tags first, then new ones
+        service, is_non_standard = determine_port_setting(ports_raw, rule_std_ports)
+
         new_rule_tags: list[str] = list(config.existing_tags)
         new_rule_tags.append(TAG_NEW_RULE)
         if is_non_standard:

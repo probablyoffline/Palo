@@ -1,0 +1,21 @@
+# risky-apps.txt
+#
+# Applications listed here are considered risky to the organization.
+# If any of these apps are observed in a rule's traffic, the new App-ID
+# rule will receive the risky-app tag.
+#
+# App names must match exactly what PAN-OS returns in the traffic log
+# 'app' field (lowercase). Lines starting with # are comments.
+
+# ── Remote access / admin ─────────────────────────────────────────────────────
+ssh
+ms-rdp
+telnet
+vnc-base
+
+# ── File transfer ─────────────────────────────────────────────────────────────
+ftp
+tftp
+
+# ── Legacy / high-risk ────────────────────────────────────────────────────────
+irc

@@ -1,0 +1,60 @@
+# standard-ports.txt
+#
+# Ports listed here must match what Palo Alto's application database officially
+# defines as the standard port for the application — not just ports that are
+# commonly used.
+#
+# Example: ssl/https runs on tcp-443 per Palo Alto's app-id. If a rule allows
+# tcp-8443, that is non-standard regardless of how common it is in practice,
+# because Palo Alto's application-default for ssl is tcp-443 only.
+#
+# If every port in an existing rule's service config appears in this file,
+# the new App-ID rule uses application-default. If any port is absent, all
+# ports are listed explicitly and the app-id-non-standard tag is added.
+#
+# Lines starting with # are comments. One entry per line.
+# Format mirrors PAN-OS service member names (e.g. tcp-80, udp-53).
+
+# ── Web ───────────────────────────────────────────────────────────────────────
+tcp-80
+tcp-443
+
+# ── DNS ───────────────────────────────────────────────────────────────────────
+tcp-53
+udp-53
+
+# ── Email ─────────────────────────────────────────────────────────────────────
+tcp-25
+tcp-465
+tcp-587
+tcp-110
+tcp-995
+tcp-143
+tcp-993
+
+# ── Remote access ─────────────────────────────────────────────────────────────
+tcp-22
+tcp-3389
+
+# ── File transfer ─────────────────────────────────────────────────────────────
+tcp-20
+tcp-21
+udp-69
+
+# ── Directory / auth ──────────────────────────────────────────────────────────
+tcp-389
+udp-389
+tcp-636
+tcp-88
+udp-88
+tcp-445
+udp-445
+
+# ── Other common protocols ────────────────────────────────────────────────────
+tcp-23
+udp-123
+udp-161
+udp-162
+tcp-179
+tcp-514
+udp-514
