@@ -64,6 +64,8 @@ requests.packages.urllib3.disable_warnings()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
+__version__ = "1.0"
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 STANDARD_PORTS_FILE = SCRIPT_DIR / "standard-ports.txt"
@@ -373,7 +375,6 @@ def format_new_rule_design(
     rule_name:      str,
     config:         RuleConfig,
     usable_apps:    list[str],
-    has_unknown:    bool,
     service:        str,
     new_rule_tags:  list[str],
     device_group:   str,
@@ -381,19 +382,17 @@ def format_new_rule_design(
 ) -> str:
     lines = [f"Design {design_number}", ""]
 
-    if not config.found:
-        lines.append(f"[Warning: rule '{rule_name}' was not found in config — some fields below are empty]")
-        lines.append("")
-
     lines += [
         f"In {device_group}",
         f"Clone Rule ABOVE: {rule_name}",
         f"New Rule Name: APP-ID-{rule_name}",
-        "Description:",
     ]
+
     if config.description:
-        lines.append(f"  {config.description}")
-    lines.append(f"  DDD created {run_month_year}")
+        lines.append(f"Description: {config.description}")
+        lines.append(f"  DDD created {run_month_year}")
+    else:
+        lines.append(f"Description: DDD created {run_month_year}")
 
     lines.append(f"Tags: {_csv_list(new_rule_tags)}")
     lines.append("")
@@ -411,13 +410,8 @@ def format_new_rule_design(
         "",
     ]
 
-    app_display = " | ".join(usable_apps) if usable_apps else "(none — review required)"
+    app_display = ", ".join(usable_apps) if usable_apps else "(none — review required)"
     lines.append(f"Application: {app_display}")
-    if has_unknown:
-        lines.append(
-            "  [Note: unknown-tcp/unknown-udp traffic was observed — these cannot be added as"
-            " app-id and require further investigation before the old rule can be retired]"
-        )
 
     lines += [
         f"Port: {service}",
@@ -621,6 +615,7 @@ def main() -> None:
     device_group   = ops_lib.DEVICE_GROUP
     designs: list[str] = []
     csv_rows: list[dict] = []
+    notes: list[str] = []
     design_count   = 0
     new_rule_count = 0
     unused_count   = 0
@@ -672,12 +667,24 @@ def main() -> None:
 
         design_count += 1
         new_rule_count += 1
+
+        if not config.found:
+            notes.append(
+                f"Design {design_count} — {rule_name}: rule was not found in Panorama config"
+                " — zone, address, and profile fields are empty."
+            )
+        if has_unknown:
+            notes.append(
+                f"Design {design_count} — {rule_name}: unknown-tcp/unknown-udp traffic was"
+                " observed. These sessions could not be identified by App-ID and require"
+                " investigation before the old rule can be safely retired."
+            )
+
         designs.append(format_new_rule_design(
             design_number  = design_count,
             rule_name      = rule_name,
             config         = config,
             usable_apps    = usable_apps,
-            has_unknown    = has_unknown,
             service        = service,
             new_rule_tags  = new_rule_tags,
             device_group   = device_group,
@@ -696,7 +703,30 @@ def main() -> None:
             ))
             csv_rows.append(build_tag_update_row(rule_name, TAG_UNDER_REVIEW, device_group))
 
-    text_output = "\n\n---\n\n".join(designs)
+    SEP = "=" * 62
+
+    summary_lines = [
+        "SUMMARY",
+        SEP,
+        f"Generated   : {run_dt.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"Script      : design-rule-apps.py v{__version__}",
+        f"Device group: {device_group}",
+        f"Input       : {args.input_csv}",
+        "",
+        f"Designs     : {design_count} total"
+        f" — {new_rule_count} new rule design(s)"
+        f", {unused_count} tag-update-only (no traffic)",
+    ]
+    preamble = ["\n".join(summary_lines)]
+
+    if notes:
+        note_lines = ["NOTES", SEP, ""]
+        note_lines.extend(notes)
+        preamble.append("\n".join(note_lines))
+
+    designs_block = f"DESIGNS\n{SEP}\n\n" + "\n\n---\n\n".join(designs)
+    text_output = "\n\n\n".join(preamble + [designs_block])
+
     with open(txt_path, "w", encoding="utf-8") as fh:
         fh.write(text_output + "\n")
 
