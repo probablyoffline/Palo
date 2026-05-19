@@ -64,7 +64,7 @@ requests.packages.urllib3.disable_warnings()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-__version__ = "1.1"
+__version__ = "1.2"
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
@@ -610,7 +610,7 @@ def main() -> None:
     port_mode = "static (standard-ports.txt)" if args.static_ports else "dynamic (Panorama app-id database)"
 
     print("=" * 62)
-    print("  design-rule-apps")
+    print(f"  design-rule-apps  v{__version__}")
     print("=" * 62)
     print(f"  Input       : {args.input_csv}")
     print(f"  Target      : {ops_lib.TARGET_HOST}  ({ops_lib.mode_summary()})")
