@@ -64,7 +64,7 @@ requests.packages.urllib3.disable_warnings()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-__version__ = "1.5"
+__version__ = "1.5.1"
 
 APP_REVIEW_THRESHOLD = 10  # flag designs with this many or more usable apps
 
@@ -803,7 +803,7 @@ def main() -> None:
         if generate_known and len(usable_apps) >= args.app_review_threshold:
             notes.append((
                 f"Design {known_num} — {rule_name}",
-                f"{len(usable_apps)} apps observed — manual review recommended before finalising this design.",
+                f"{len(usable_apps)} apps observed — manual review recommended before finalizing this design.",
             ))
 
         # Generate design blocks
