@@ -64,7 +64,7 @@ requests.packages.urllib3.disable_warnings()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-__version__ = "1.0"
+__version__ = "1.1"
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
@@ -388,11 +388,7 @@ def format_new_rule_design(
         f"New Rule Name: APP-ID-{rule_name}",
     ]
 
-    if config.description:
-        lines.append(f"Description: {config.description}")
-        lines.append(f"  DDD created {run_month_year}")
-    else:
-        lines.append(f"Description: DDD created {run_month_year}")
+    lines.append(f"Description: DDD created {run_month_year}")
 
     lines.append(f"Tags: {_csv_list(new_rule_tags)}")
     lines.append("")
@@ -417,20 +413,35 @@ def format_new_rule_design(
         f"Port: {service}",
         f"Action: {config.action}",
         f"Group profile: {config.group_profile or '(none)'}",
-        "",
-        f"Old Rule Update — {rule_name}",
-        f"  Add Tag: {TAG_UNDER_REVIEW}",
     ]
 
     return "\n".join(lines)
 
 
-def format_unused_design(design_number: int, rule_name: str) -> str:
+def format_rule_update(rule_name: str, tag: str, device_group: str, run_month_year: str) -> str:
+    return "\n".join([
+        f"In {device_group}",
+        f"Action: Add tag",
+        f"Rule Name: {rule_name}",
+        f"Description: DDD updated {run_month_year}",
+        f"Tag: {tag}",
+    ])
+
+
+def format_unused_design(
+    design_number: int,
+    rule_name:     str,
+    device_group:  str,
+    run_month_year: str,
+) -> str:
     return "\n".join([
         f"Design {design_number}",
         "",
-        f"Old Rule Update — {rule_name}",
-        f"  Add Tag: {TAG_UNUSED}",
+        f"In {device_group}",
+        f"Action: Add tag",
+        f"Rule Name: {rule_name}",
+        f"Description: DDD updated {run_month_year}",
+        f"Tag: {TAG_UNUSED}",
     ])
 
 
@@ -641,7 +652,7 @@ def main() -> None:
         if complete == "skipped" or has_no_apps:
             design_count += 1
             unused_count += 1
-            designs.append(format_unused_design(design_count, rule_name))
+            designs.append(format_unused_design(design_count, rule_name, device_group, run_month_year))
             if not args.no_csv:
                 csv_rows.append(build_tag_update_row(rule_name, TAG_UNUSED, device_group))
             continue
@@ -690,6 +701,7 @@ def main() -> None:
             device_group   = device_group,
             run_month_year = run_month_year,
         ))
+        designs.append(format_rule_update(rule_name, TAG_UNDER_REVIEW, device_group, run_month_year))
 
         if not args.no_csv:
             csv_rows.append(build_new_rule_row(
