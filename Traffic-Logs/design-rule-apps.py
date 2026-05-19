@@ -64,7 +64,9 @@ requests.packages.urllib3.disable_warnings()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-__version__ = "1.3"
+__version__ = "1.5"
+
+APP_REVIEW_THRESHOLD = 10  # flag designs with this many or more usable apps
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
@@ -411,7 +413,7 @@ def format_new_rule_design(
     lines.append(f"Application: {app_display}")
 
     lines += [
-        f"Port: {service}",
+        f"Port: {service.replace(' | ', ', ')}",
         f"Action: {config.action}",
         f"Group profile: {config.group_profile or '(none)'}",
     ]
@@ -434,7 +436,7 @@ def format_unknown_rule_design(
     tags = list(config.existing_tags) + [TAG_NEW_RULE, TAG_UNKNOWN]
 
     ports = [p.strip() for p in ports_raw.split("|") if p.strip()]
-    service = " | ".join(ports) if ports and ports != ["application-default"] else "application-default"
+    service = ", ".join(ports) if ports and ports != ["application-default"] else "application-default"
 
     lines = [f"Design {design_number}", ""]
     lines += [
@@ -590,6 +592,11 @@ def main() -> None:
     parser.add_argument(
         "--no-csv", action="store_true",
         help="Skip the structured CSV output; generate text design file only",
+    )
+    parser.add_argument(
+        "--app-review-threshold", metavar="N", type=int, dest="app_review_threshold",
+        default=APP_REVIEW_THRESHOLD,
+        help=f"Flag designs with this many or more apps for manual review (default: {APP_REVIEW_THRESHOLD})",
     )
     args = parser.parse_args()
 
@@ -760,37 +767,44 @@ def main() -> None:
         update_num = design_count
         update_count += 1
 
-        # Notes — reference the first block for this rule
+        # Notes — (prefix, message) tuples; rendered with aligned columns
         first_num = known_num if known_num is not None else (unknown_num if unknown_num is not None else update_num)
         if not config.found:
-            notes.append(
-                f"Design {first_num} — {rule_name}: rule was not found in Panorama config"
-                " — zone, address, and profile fields are empty."
-            )
+            notes.append((
+                f"Design {first_num} — {rule_name}",
+                "rule was not found in Panorama config — zone, address, and profile fields are empty.",
+            ))
         if known_exists and usable_apps:
-            notes.append(
-                f"Design {update_num} — {rule_name}: APP-ID-{rule_name} already exists"
-                " — new rule design skipped."
-            )
+            notes.append((
+                f"Design {update_num} — {rule_name}",
+                f"APP-ID-{rule_name} already exists — new rule design skipped.",
+            ))
         if unknown_exists and unknown_apps:
-            notes.append(
-                f"Design {update_num} — {rule_name}: APP-ID-{rule_name}-UNKNOWN already exists"
-                " — unknown-traffic rule design skipped."
-            )
+            notes.append((
+                f"Design {update_num} — {rule_name}",
+                f"APP-ID-{rule_name}-UNKNOWN already exists — unknown-traffic rule design skipped.",
+            ))
         if generate_unknown:
             if generate_known:
-                notes.append(
-                    f"Design {known_num} — {rule_name}: unknown-tcp/unknown-udp traffic was"
-                    f" observed. A separate unknown-traffic rule has been generated as"
-                    f" Design {unknown_num}. These sessions could not be identified by App-ID"
-                    " and require investigation before the old rule can be safely retired."
-                )
+                notes.append((
+                    f"Design {known_num} — {rule_name}",
+                    f"unknown-tcp/unknown-udp traffic was observed. A separate unknown-traffic"
+                    f" rule has been generated as Design {unknown_num}. These sessions could not"
+                    " be identified by App-ID and require investigation before the old rule can"
+                    " be safely retired.",
+                ))
             else:
-                notes.append(
-                    f"Design {unknown_num} — {rule_name}: only unknown-tcp/unknown-udp traffic"
-                    " was observed. These sessions could not be identified by App-ID and require"
-                    " investigation before the old rule can be safely retired."
-                )
+                notes.append((
+                    f"Design {unknown_num} — {rule_name}",
+                    "only unknown-tcp/unknown-udp traffic was observed. These sessions could not"
+                    " be identified by App-ID and require investigation before the old rule can"
+                    " be safely retired.",
+                ))
+        if generate_known and len(usable_apps) >= args.app_review_threshold:
+            notes.append((
+                f"Design {known_num} — {rule_name}",
+                f"{len(usable_apps)} apps observed — manual review recommended before finalising this design.",
+            ))
 
         # Generate design blocks
         if generate_known:
@@ -875,8 +889,10 @@ def main() -> None:
     preamble = ["\n".join(summary_lines)]
 
     if notes:
+        pad = max(len(p) for p, _ in notes)
         note_lines = ["NOTES", SEP, ""]
-        note_lines.extend(notes)
+        for prefix, message in notes:
+            note_lines.append(f"{prefix.ljust(pad)}: {message}")
         preamble.append("\n".join(note_lines))
 
     designs_block = f"DESIGNS\n{SEP}\n\n" + "\n\n---\n\n".join(designs)
