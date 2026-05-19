@@ -64,7 +64,7 @@ requests.packages.urllib3.disable_warnings()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-__version__ = "1.2"
+__version__ = "1.3"
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
@@ -650,8 +650,8 @@ def main() -> None:
     configs = fetch_full_rule_configs(rule_names + app_id_names)
     found            = sum(1 for n in rule_names   if configs[n].found)
     existing_app_ids = sum(1 for n in app_id_names if configs[n].found)
-    suffix = f"  ({existing_app_ids} existing APP-ID rule(s) detected)" if existing_app_ids else ""
-    print(f"{found}/{len(rule_names)} found{suffix}")
+    dup_suffix = f"  ({existing_app_ids} existing APP-ID rule(s) — duplicates skipped)" if existing_app_ids else "  (0 existing APP-ID rules — no duplicates)"
+    print(f"{found}/{len(rule_names)} found{dup_suffix}")
 
     # ── App default port lookup ───────────────────────────────────────────────
     # app_port_map: app_name → set of 'tcp-80' style standard port strings
@@ -869,6 +869,8 @@ def main() -> None:
         f" — {total_new} new rule(s)"
         f", {update_count} tag update(s)"
         f", {unused_count} unused (no traffic)",
+        f"Duplicates  : {existing_app_ids} existing APP-ID rule(s) detected"
+        + (" — skipped" if existing_app_ids else " — none"),
     ]
     preamble = ["\n".join(summary_lines)]
 
