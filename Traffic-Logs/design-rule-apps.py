@@ -643,10 +643,15 @@ def main() -> None:
 
     rule_names = [r["rule"] for r in rows if r.get("rule")]
 
+    # Include APP-ID names so we can detect duplicates in the same bulk call
+    app_id_names = [f"APP-ID-{n}" for n in rule_names] + [f"APP-ID-{n}-UNKNOWN" for n in rule_names]
+
     print(f"  Fetching rule configs for {len(rule_names)} rules ...", end=" ", flush=True)
-    configs = fetch_full_rule_configs(rule_names)
-    found   = sum(1 for c in configs.values() if c.found)
-    print(f"{found}/{len(rule_names)} found")
+    configs = fetch_full_rule_configs(rule_names + app_id_names)
+    found            = sum(1 for n in rule_names   if configs[n].found)
+    existing_app_ids = sum(1 for n in app_id_names if configs[n].found)
+    suffix = f"  ({existing_app_ids} existing APP-ID rule(s) detected)" if existing_app_ids else ""
+    print(f"{found}/{len(rule_names)} found{suffix}")
 
     # ── App default port lookup ───────────────────────────────────────────────
     # app_port_map: app_name → set of 'tcp-80' style standard port strings
@@ -734,14 +739,20 @@ def main() -> None:
         if has_risky:
             new_rule_tags.append(TAG_RISKY)
 
+        # Check for existing APP-ID rules to avoid duplicate designs
+        known_exists   = configs[f"APP-ID-{rule_name}"].found
+        unknown_exists = configs[f"APP-ID-{rule_name}-UNKNOWN"].found
+        generate_known   = bool(usable_apps)  and not known_exists
+        generate_unknown = bool(unknown_apps) and not unknown_exists
+
         # Pre-assign design numbers for every block this rule will produce
         known_num   = None
         unknown_num = None
-        if usable_apps:
+        if generate_known:
             design_count += 1
             known_num = design_count
             new_rule_count += 1
-        if has_unknown:
+        if generate_unknown:
             design_count += 1
             unknown_num = design_count
             unknown_rule_count += 1
@@ -750,14 +761,24 @@ def main() -> None:
         update_count += 1
 
         # Notes — reference the first block for this rule
-        first_num = known_num if known_num is not None else unknown_num
+        first_num = known_num if known_num is not None else (unknown_num if unknown_num is not None else update_num)
         if not config.found:
             notes.append(
                 f"Design {first_num} — {rule_name}: rule was not found in Panorama config"
                 " — zone, address, and profile fields are empty."
             )
-        if has_unknown:
-            if known_num is not None:
+        if known_exists and usable_apps:
+            notes.append(
+                f"Design {update_num} — {rule_name}: APP-ID-{rule_name} already exists"
+                " — new rule design skipped."
+            )
+        if unknown_exists and unknown_apps:
+            notes.append(
+                f"Design {update_num} — {rule_name}: APP-ID-{rule_name}-UNKNOWN already exists"
+                " — unknown-traffic rule design skipped."
+            )
+        if generate_unknown:
+            if generate_known:
                 notes.append(
                     f"Design {known_num} — {rule_name}: unknown-tcp/unknown-udp traffic was"
                     f" observed. A separate unknown-traffic rule has been generated as"
@@ -772,7 +793,7 @@ def main() -> None:
                 )
 
         # Generate design blocks
-        if usable_apps:
+        if generate_known:
             designs.append(format_new_rule_design(
                 design_number  = known_num,
                 rule_name      = rule_name,
@@ -783,7 +804,7 @@ def main() -> None:
                 device_group   = device_group,
                 run_month_year = run_month_year,
             ))
-        if has_unknown:
+        if generate_unknown:
             designs.append(format_unknown_rule_design(
                 design_number  = unknown_num,
                 rule_name      = rule_name,
