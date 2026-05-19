@@ -335,25 +335,26 @@ def determine_port_setting(
 def classify_apps(
     apps_raw: str,
     risky_apps: set[str],
-) -> tuple[list[str], bool, bool]:
+) -> tuple[list[str], list[str], bool]:
     """
-    Returns (usable_apps, has_unknown, has_risky).
+    Returns (usable_apps, unknown_apps, has_risky).
 
-    usable_apps: app names suitable for an app-id rule (excludes incomplete/not-applicable/unknown)
-    has_unknown: True if unknown-tcp or unknown-udp was observed
-    has_risky:   True if any risky app was observed
+    usable_apps:  app names suitable for an app-id rule (excludes incomplete/not-applicable/unknown)
+    unknown_apps: observed unknown values, e.g. ['unknown-tcp', 'unknown-udp']
+    has_risky:    True if any risky app was observed
     """
     if not apps_raw:
-        return [], False, False
+        return [], [], False
 
-    usable: list[str] = []
-    has_unknown = False
-    has_risky   = False
+    usable:  list[str] = []
+    unknown: list[str] = []
+    has_risky = False
 
     for app in (a.strip() for a in apps_raw.split("|") if a.strip()):
         app_lower = app.lower()
         if app_lower in UNKNOWN_APP_VALUES:
-            has_unknown = True
+            if app_lower not in unknown:
+                unknown.append(app_lower)
         elif app_lower in NON_APP_VALUES:
             pass
         else:
@@ -361,7 +362,7 @@ def classify_apps(
             if app_lower in risky_apps:
                 has_risky = True
 
-    return usable, has_unknown, has_risky
+    return usable, unknown, has_risky
 
 
 # ── Design formatters ─────────────────────────────────────────────────────────
@@ -418,8 +419,63 @@ def format_new_rule_design(
     return "\n".join(lines)
 
 
-def format_rule_update(rule_name: str, tag: str, device_group: str, run_month_year: str) -> str:
+def format_unknown_rule_design(
+    design_number:  int,
+    rule_name:      str,
+    config:         RuleConfig,
+    unknown_apps:   list[str],
+    ports_raw:      str,
+    device_group:   str,
+    run_month_year: str,
+    has_known_apps: bool,
+) -> str:
+    new_rule_name = f"APP-ID-{rule_name}-UNKNOWN" if has_known_apps else f"APP-ID-{rule_name}"
+
+    tags = list(config.existing_tags) + [TAG_NEW_RULE, TAG_UNKNOWN]
+
+    ports = [p.strip() for p in ports_raw.split("|") if p.strip()]
+    service = " | ".join(ports) if ports and ports != ["application-default"] else "application-default"
+
+    lines = [f"Design {design_number}", ""]
+    lines += [
+        f"In {device_group}",
+        f"Clone Rule ABOVE: {rule_name}",
+        f"New Rule Name: {new_rule_name}",
+        f"Description: DDD created {run_month_year}",
+        f"Tags: {_csv_list(tags)}",
+        "",
+        f"Source Zone: {_csv_list(config.source_zones)}",
+        f"Source Address: {_csv_list(config.source_addrs)}",
+    ]
+
+    non_any_users = [u for u in config.source_users if u.lower() != "any"]
+    if non_any_users:
+        lines.append(f"Source User: {_csv_list(non_any_users)}")
+
+    lines += [
+        "",
+        f"Dest Zone: {_csv_list(config.dest_zones)}",
+        f"Dest Address: {_csv_list(config.dest_addrs)}",
+        "",
+        f"Application: {', '.join(unknown_apps)}",
+        f"Port: {service}",
+        f"Action: {config.action}",
+        f"Group profile: {config.group_profile or '(none)'}",
+    ]
+
+    return "\n".join(lines)
+
+
+def format_rule_update(
+    design_number:  int,
+    rule_name:      str,
+    tag:            str,
+    device_group:   str,
+    run_month_year: str,
+) -> str:
     return "\n".join([
+        f"Design {design_number}",
+        "",
         f"In {device_group}",
         f"Action: Add tag",
         f"Rule Name: {rule_name}",
@@ -623,13 +679,15 @@ def main() -> None:
 
     print()
 
-    device_group   = ops_lib.DEVICE_GROUP
+    device_group      = ops_lib.DEVICE_GROUP
     designs: list[str] = []
     csv_rows: list[dict] = []
     notes: list[str] = []
-    design_count   = 0
-    new_rule_count = 0
-    unused_count   = 0
+    design_count      = 0
+    new_rule_count    = 0
+    unknown_rule_count = 0
+    update_count      = 0
+    unused_count      = 0
 
     for row in rows:
         rule_name = row.get("rule", "").strip()
@@ -641,7 +699,8 @@ def main() -> None:
         ports_raw = row.get("ports", "").strip()
         config    = configs[rule_name]
 
-        usable_apps, has_unknown, has_risky = classify_apps(apps_raw, risky_apps)
+        usable_apps, unknown_apps, has_risky = classify_apps(apps_raw, risky_apps)
+        has_unknown = bool(unknown_apps)
         has_no_apps = not usable_apps and not has_unknown
 
         if complete == "no" and has_no_apps:
@@ -667,44 +726,55 @@ def main() -> None:
 
         service, is_non_standard = determine_port_setting(ports_raw, rule_std_ports)
 
+        # Known-apps rule tags (app-id-unknown goes on the unknown rule, not here)
         new_rule_tags: list[str] = list(config.existing_tags)
         new_rule_tags.append(TAG_NEW_RULE)
         if is_non_standard:
             new_rule_tags.append(TAG_NON_STANDARD)
-        if has_unknown:
-            new_rule_tags.append(TAG_UNKNOWN)
         if has_risky:
             new_rule_tags.append(TAG_RISKY)
 
+        # Pre-assign design numbers for every block this rule will produce
+        known_num   = None
+        unknown_num = None
+        if usable_apps:
+            design_count += 1
+            known_num = design_count
+            new_rule_count += 1
+        if has_unknown:
+            design_count += 1
+            unknown_num = design_count
+            unknown_rule_count += 1
         design_count += 1
-        new_rule_count += 1
+        update_num = design_count
+        update_count += 1
 
+        # Notes — reference the first block for this rule
+        first_num = known_num if known_num is not None else unknown_num
         if not config.found:
             notes.append(
-                f"Design {design_count} — {rule_name}: rule was not found in Panorama config"
+                f"Design {first_num} — {rule_name}: rule was not found in Panorama config"
                 " — zone, address, and profile fields are empty."
             )
         if has_unknown:
-            notes.append(
-                f"Design {design_count} — {rule_name}: unknown-tcp/unknown-udp traffic was"
-                " observed. These sessions could not be identified by App-ID and require"
-                " investigation before the old rule can be safely retired."
-            )
+            if known_num is not None:
+                notes.append(
+                    f"Design {known_num} — {rule_name}: unknown-tcp/unknown-udp traffic was"
+                    f" observed. A separate unknown-traffic rule has been generated as"
+                    f" Design {unknown_num}. These sessions could not be identified by App-ID"
+                    " and require investigation before the old rule can be safely retired."
+                )
+            else:
+                notes.append(
+                    f"Design {unknown_num} — {rule_name}: only unknown-tcp/unknown-udp traffic"
+                    " was observed. These sessions could not be identified by App-ID and require"
+                    " investigation before the old rule can be safely retired."
+                )
 
-        designs.append(format_new_rule_design(
-            design_number  = design_count,
-            rule_name      = rule_name,
-            config         = config,
-            usable_apps    = usable_apps,
-            service        = service,
-            new_rule_tags  = new_rule_tags,
-            device_group   = device_group,
-            run_month_year = run_month_year,
-        ))
-        designs.append(format_rule_update(rule_name, TAG_UNDER_REVIEW, device_group, run_month_year))
-
-        if not args.no_csv:
-            csv_rows.append(build_new_rule_row(
+        # Generate design blocks
+        if usable_apps:
+            designs.append(format_new_rule_design(
+                design_number  = known_num,
                 rule_name      = rule_name,
                 config         = config,
                 usable_apps    = usable_apps,
@@ -713,10 +783,59 @@ def main() -> None:
                 device_group   = device_group,
                 run_month_year = run_month_year,
             ))
+        if has_unknown:
+            designs.append(format_unknown_rule_design(
+                design_number  = unknown_num,
+                rule_name      = rule_name,
+                config         = config,
+                unknown_apps   = unknown_apps,
+                ports_raw      = ports_raw,
+                device_group   = device_group,
+                run_month_year = run_month_year,
+                has_known_apps = bool(usable_apps),
+            ))
+        designs.append(format_rule_update(update_num, rule_name, TAG_UNDER_REVIEW, device_group, run_month_year))
+
+        if not args.no_csv:
+            if usable_apps:
+                csv_rows.append(build_new_rule_row(
+                    rule_name      = rule_name,
+                    config         = config,
+                    usable_apps    = usable_apps,
+                    service        = service,
+                    new_rule_tags  = new_rule_tags,
+                    device_group   = device_group,
+                    run_month_year = run_month_year,
+                ))
+            if has_unknown:
+                unknown_rule_name = f"APP-ID-{rule_name}-UNKNOWN" if usable_apps else f"APP-ID-{rule_name}"
+                ports = [p.strip() for p in ports_raw.split("|") if p.strip()]
+                unknown_service = " | ".join(ports) if ports and ports != ["application-default"] else "application-default"
+                unknown_tags = list(config.existing_tags) + [TAG_NEW_RULE, TAG_UNKNOWN]
+                non_any_users = [u for u in config.source_users if u.lower() != "any"]
+                csv_rows.append({
+                    "type":             "new_rule",
+                    "device_group":     device_group,
+                    "rule_name":        unknown_rule_name,
+                    "clone_above":      rule_name,
+                    "description":      f"DDD created {run_month_year}",
+                    "tags":             "|".join(unknown_tags),
+                    "source_zones":     "|".join(config.source_zones),
+                    "source_addresses": "|".join(config.source_addrs),
+                    "source_user":      "|".join(non_any_users),
+                    "dest_zones":       "|".join(config.dest_zones),
+                    "dest_addresses":   "|".join(config.dest_addrs),
+                    "applications":     "|".join(unknown_apps),
+                    "service":          unknown_service,
+                    "action":           config.action,
+                    "group_profile":    config.group_profile,
+                    "tags_to_add":      "",
+                })
             csv_rows.append(build_tag_update_row(rule_name, TAG_UNDER_REVIEW, device_group))
 
     SEP = "=" * 62
 
+    total_new = new_rule_count + unknown_rule_count
     summary_lines = [
         "SUMMARY",
         SEP,
@@ -726,8 +845,9 @@ def main() -> None:
         f"Input       : {args.input_csv}",
         "",
         f"Designs     : {design_count} total"
-        f" — {new_rule_count} new rule design(s)"
-        f", {unused_count} tag-update-only (no traffic)",
+        f" — {total_new} new rule(s)"
+        f", {update_count} tag update(s)"
+        f", {unused_count} unused (no traffic)",
     ]
     preamble = ["\n".join(summary_lines)]
 
@@ -750,7 +870,7 @@ def main() -> None:
 
     print("=" * 62)
     print(f"  {design_count} design(s) total")
-    print(f"  {new_rule_count} new rule design(s)  |  {unused_count} tag-update-only (no traffic)")
+    print(f"  {total_new} new rule(s)  |  {update_count} tag update(s)  |  {unused_count} unused (no traffic)")
     print(f"  Text : {txt_path}")
     if not args.no_csv:
         print(f"  CSV  : {csv_path}")
