@@ -66,7 +66,7 @@ import ops_lib        # noqa: E402
 import log_query_lib  # noqa: E402
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-VERSION              = "1.5.1"
+VERSION              = "1.5.2"
 
 DAYS_BACK            = 7
 MAX_LOGS             = 5000
@@ -148,30 +148,6 @@ def fetch_hit_counts(debug_path: str | None = None) -> dict[str, int]:
                 except ValueError:
                     hit_counts[name] = 0
     return hit_counts
-
-
-def precheck_has_traffic(
-    rule_name: str,
-    start_dt: datetime.datetime,
-    end_dt: datetime.datetime,
-    action: str,
-) -> bool:
-    """
-    Submit a single nlogs=1 query for the rule. Returns True if any log
-    entry exists in the window, False if none. Returns True on any error
-    so the rule is queried rather than silently skipped.
-    """
-    try:
-        _, _, count, _, ok = log_query_lib.query_window(
-            rule_name, start_dt, end_dt, action,
-            max_logs=1,
-            poll_interval=POLL_INTERVAL,
-            poll_timeout=POLL_TIMEOUT,
-            http_timeout=HTTP_TIMEOUT,
-        )
-        return True if not ok else count > 0
-    except Exception:
-        return True
 
 
 # ── Resume helpers ────────────────────────────────────────────────────────────
@@ -316,7 +292,6 @@ def _process_rule(
     end_dt:         datetime.datetime,
     action:         str,
     max_queries:    int,
-    use_precheck:   bool,
     services_map:   dict[str, list[str]],
     rule_stats:     dict[str, int] | None,
     oldest_log_dt:  datetime.datetime | None,
@@ -375,25 +350,6 @@ def _process_rule(
         return row, "\n".join(lines)
 
     # ── Log query path ────────────────────────────────────────────────────────
-    if use_precheck:
-        lines.append("  precheck ...")
-        has_traffic = precheck_has_traffic(rule_name, start_dt, end_dt, action)
-        if not has_traffic:
-            lines[-1] += "  no traffic — skipped"
-            row = {
-                "rule":            rule_name,
-                "app_count":       0,
-                "apps":            "",
-                "port_count":      len(services),
-                "ports":           "|".join(services),
-                "entries_scanned": 0,
-                "windows_queried": 1,
-                "complete":        "skipped",
-                "data_source":     "",
-            }
-            return row, "\n".join(lines)
-        lines[-1] += "  traffic found — querying"
-
     all_apps, total_entries, complete, queries_used = log_query_lib.collect_apps(
         rule_name, start_dt, end_dt, action,
         max_queries  = max_queries,
@@ -654,9 +610,8 @@ def main() -> None:
 
     # ── Activity pre-filter ───────────────────────────────────────────────────
     # active_rules: set  → batch hit-count filter succeeded; only these are queried
-    # active_rules: None → no batch filter; use per-rule precheck if skip_unused
+    # active_rules: None → no batch filter; all rules proceed to collect_apps
     active_rules: set[str] | None = None
-    use_precheck = False
 
     if args.skip_unused:
         debug_path = args.debug_hitcount or None
@@ -689,9 +644,8 @@ def main() -> None:
         except Exception as exc:
             print(
                 f"hit-count API unavailable ({exc})\n"
-                f"  Falling back to per-rule traffic precheck (1 query per rule)."
+                f"  Falling back to querying all rules — inactive rules will show app_count=0."
             )
-            use_precheck = True
         print()
 
     # ── Rule app stats + oldest log timestamp ────────────────────────────────
@@ -736,7 +690,6 @@ def main() -> None:
         end_dt          = end_dt,
         action          = args.action,
         max_queries     = args.max_queries_per_rule,
-        use_precheck    = use_precheck,
         services_map    = services_map,
         oldest_log_dt   = oldest_log_dt,
         stats_cutoff_dt = stats_cutoff_dt,
