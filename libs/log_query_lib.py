@@ -6,10 +6,12 @@ firewall log API.  Intended for use by any ops script that needs to query or
 paginate traffic logs.
 
 Public API:
-    query_window(...)    Submit and poll one log query; returns entry elements,
-                         distinct apps, entry count, and cap/ok flags.
-    collect_apps(...)    Iterative app-exclusion loop over a full date range;
-                         finds all distinct apps regardless of traffic volume.
+    query_window(...)       Submit and poll one log query; returns entry elements,
+                            distinct apps, entry count, and cap/ok flags.
+    collect_apps(...)       Iterative app-exclusion loop over a full date range;
+                            finds all distinct apps regardless of traffic volume.
+    fetch_oldest_log_dt()   Timestamp of the oldest available traffic log entry.
+    fetch_newest_log_dt()   Timestamp of the newest available traffic log entry.
 
 Both functions read TARGET_HOST and API_KEY from ops_lib.
 
@@ -92,13 +94,14 @@ def _submit_job(
     query: str,
     nlogs: int = MAX_LOGS,
     http_timeout: float = HTTP_TIMEOUT,
+    direction: str = "backward",
 ) -> str | None:
     params = {
         "type":     "log",
         "log-type": "traffic",
         "query":    query,
         "nlogs":    str(nlogs),
-        "dir":      "backward",
+        "dir":      direction,
         "key":      ops_lib.API_KEY,
     }
     root = ET.fromstring(_post(params, http_timeout))
@@ -279,3 +282,93 @@ def collect_apps(
 
         if query_delay > 0:
             time.sleep(query_delay)
+
+
+def fetch_newest_log_dt(
+    poll_interval: float = POLL_INTERVAL,
+    poll_timeout: float  = POLL_TIMEOUT,
+    http_timeout: float  = HTTP_TIMEOUT,
+) -> datetime.datetime | None:
+    """
+    Return the receive_time of the newest available traffic log entry.
+    Used to anchor a query's end window to actual log availability rather
+    than script run time, so summary files reflect real data boundaries.
+    Returns None if the query fails or no entries exist.
+    """
+    try:
+        job_id = _submit_job(
+            "(receive_time geq '2000/01/01 00:00:00')",
+            nlogs=1,
+            http_timeout=http_timeout,
+            direction="backward",
+        )
+        if job_id is None:
+            return None
+
+        result_xml = _poll_job(job_id, poll_interval, poll_timeout, http_timeout)
+        if result_xml is None:
+            return None
+
+        root    = ET.fromstring(result_xml)
+        entries = list(root.iter("entry"))
+        if not entries:
+            return None
+
+        ts_str = entries[0].findtext("receive_time")
+        if not ts_str:
+            return None
+
+        for fmt in ("%Y/%m/%d %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+            try:
+                return datetime.datetime.strptime(ts_str.strip(), fmt)
+            except ValueError:
+                continue
+        return None
+
+    except Exception:
+        return None
+
+
+def fetch_oldest_log_dt(
+    poll_interval: float = POLL_INTERVAL,
+    poll_timeout: float  = POLL_TIMEOUT,
+    http_timeout: float  = HTTP_TIMEOUT,
+) -> datetime.datetime | None:
+    """
+    Return the receive_time of the oldest available traffic log entry.
+    Used to establish the start of Panorama's log retention window so
+    callers can decide whether rule app stats predate the log window.
+    Returns None if the query fails or no entries exist.
+    """
+    try:
+        job_id = _submit_job(
+            "(receive_time geq '2000/01/01 00:00:00')",
+            nlogs=1,
+            http_timeout=http_timeout,
+            direction="forward",
+        )
+        if job_id is None:
+            return None
+
+        result_xml = _poll_job(job_id, poll_interval, poll_timeout, http_timeout)
+        if result_xml is None:
+            return None
+
+        root    = ET.fromstring(result_xml)
+        entries = list(root.iter("entry"))
+        if not entries:
+            return None
+
+        ts_str = entries[0].findtext("receive_time")
+        if not ts_str:
+            return None
+
+        for fmt in ("%Y/%m/%d %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+            try:
+                return datetime.datetime.strptime(ts_str.strip(), fmt)
+            except ValueError:
+                continue
+        return None
+
+    except Exception:
+        return None

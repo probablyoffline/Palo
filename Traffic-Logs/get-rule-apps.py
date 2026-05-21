@@ -567,6 +567,31 @@ def main() -> None:
         start_dt = run_dt - datetime.timedelta(days=days)
         end_dt   = run_dt
 
+    # ── Anchor end_dt to the newest available log ─────────────────────────────
+    # Skipped when --end is explicitly specified.
+    # Ensures summary files record the actual data boundary, not script run time,
+    # which gives compare-rule-apps.py accurate windows for gap detection.
+    end_from_newest_log = False
+    if not args.end:
+        print("  Querying newest log timestamp ...", end=" ", flush=True)
+        newest_log_dt = log_query_lib.fetch_newest_log_dt(
+            poll_timeout=POLL_TIMEOUT,
+            http_timeout=HTTP_TIMEOUT,
+        )
+        if newest_log_dt and newest_log_dt > start_dt:
+            end_dt = newest_log_dt
+            end_from_newest_log = True
+            print(newest_log_dt.strftime("%Y-%m-%d %H:%M:%S"), flush=True)
+        elif newest_log_dt:
+            print(
+                f"newest log ({newest_log_dt.strftime('%Y-%m-%d')}) predates "
+                f"query start — using run time",
+                flush=True,
+            )
+        else:
+            print("unavailable — using run time", flush=True)
+        print()
+
     try:
         rule_names = ops_lib.load_rule_names(args.input_file)
     except FileNotFoundError:
@@ -598,7 +623,8 @@ def main() -> None:
     print("=" * 62)
     print(f"  Target      : {ops_lib.TARGET_HOST}  ({ops_lib.mode_summary()})")
     print(f"  From        : {start_dt.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"  To          : {end_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+    to_note = "  (newest available log)" if end_from_newest_log else ""
+    print(f"  To          : {end_dt.strftime('%Y-%m-%d %H:%M:%S')}{to_note}")
     print(f"  Action      : {args.action}")
     print(f"  Query cap   : {args.max_queries_per_rule} per rule")
     print(f"  Poll timeout: {POLL_TIMEOUT}s per job")
@@ -828,7 +854,8 @@ def main() -> None:
         f"  Target           : {ops_lib.TARGET_HOST}  ({ops_lib.mode_summary()})",
         f"  Input            : {args.input_file}",
         f"  From             : {start_dt.strftime('%Y-%m-%d %H:%M:%S')}",
-        f"  To               : {end_dt.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"  To               : {end_dt.strftime('%Y-%m-%d %H:%M:%S')}"
+        + ("  (newest available log)" if end_from_newest_log else ""),
         f"  Action           : {args.action}",
         f"  Query cap        : {args.max_queries_per_rule} per rule",
         f"  Poll timeout     : {POLL_TIMEOUT}s per job",
