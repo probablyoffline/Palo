@@ -567,30 +567,7 @@ def main() -> None:
         start_dt = run_dt - datetime.timedelta(days=days)
         end_dt   = run_dt
 
-    # ── Anchor end_dt to the newest available log ─────────────────────────────
-    # Skipped when --end is explicitly specified.
-    # Ensures summary files record the actual data boundary, not script run time,
-    # which gives compare-rule-apps.py accurate windows for gap detection.
     end_from_newest_log = False
-    if not args.end:
-        print("  Querying newest log timestamp ...", end=" ", flush=True)
-        newest_log_dt = log_query_lib.fetch_newest_log_dt(
-            poll_timeout=POLL_TIMEOUT,
-            http_timeout=HTTP_TIMEOUT,
-        )
-        if newest_log_dt and newest_log_dt > start_dt:
-            end_dt = newest_log_dt
-            end_from_newest_log = True
-            print(newest_log_dt.strftime("%Y-%m-%d %H:%M:%S"), flush=True)
-        elif newest_log_dt:
-            print(
-                f"newest log ({newest_log_dt.strftime('%Y-%m-%d')}) predates "
-                f"query start — using run time",
-                flush=True,
-            )
-        else:
-            print("unavailable — using run time", flush=True)
-        print()
 
     try:
         rule_names = ops_lib.load_rule_names(args.input_file)
@@ -623,6 +600,23 @@ def main() -> None:
     print("=" * 62)
     print(f"  Target      : {ops_lib.TARGET_HOST}  ({ops_lib.mode_summary()})")
     print(f"  From        : {start_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+
+    if not args.end:
+        print("  Querying end time ...", end=" ", flush=True)
+        newest_log_dt = log_query_lib.fetch_newest_log_dt(
+            poll_timeout=POLL_TIMEOUT,
+            http_timeout=HTTP_TIMEOUT,
+            verbose=True,
+        )
+        if newest_log_dt and newest_log_dt > start_dt:
+            end_dt = newest_log_dt
+            end_from_newest_log = True
+        elif newest_log_dt:
+            print(f"  (predates query start — using run time)", end="", flush=True)
+        else:
+            print("  (unavailable — using run time)", end="", flush=True)
+        print(flush=True)
+
     to_note = "  (newest available log)" if end_from_newest_log else ""
     print(f"  To          : {end_dt.strftime('%Y-%m-%d %H:%M:%S')}{to_note}")
     print(f"  Action      : {args.action}")
@@ -720,11 +714,12 @@ def main() -> None:
             oldest_log_dt = log_query_lib.fetch_oldest_log_dt(
                 poll_timeout=POLL_TIMEOUT,
                 http_timeout=HTTP_TIMEOUT,
+                verbose=True,
             )
             if oldest_log_dt:
-                print(f"{oldest_log_dt.strftime('%Y-%m-%d')}", flush=True)
+                print(f"  {oldest_log_dt.strftime('%Y-%m-%d')}", flush=True)
             else:
-                print("unavailable — will use log queries for all rules", flush=True)
+                print("  unavailable — will use log queries for all rules", flush=True)
                 all_rule_stats = None
         else:
             print("unavailable — will use log queries for all rules", flush=True)
