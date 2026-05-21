@@ -66,7 +66,7 @@ import ops_lib        # noqa: E402
 import log_query_lib  # noqa: E402
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-VERSION              = "1.5.0"
+VERSION              = "1.5.1"
 
 DAYS_BACK            = 7
 MAX_LOGS             = 5000
