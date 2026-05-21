@@ -5,6 +5,8 @@ Configure the TARGET, MODE, and DEVICE_GROUP / VSYS below before running
 any ops-* script.  All four ops scripts import this module directly.
 """
 
+VERSION = "1.0.0"
+
 import configparser
 import csv
 import datetime

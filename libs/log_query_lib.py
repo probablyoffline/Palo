@@ -47,6 +47,8 @@ import ops_lib  # noqa — expected to be on sys.path by the calling script
 requests.packages.urllib3.disable_warnings()
 
 
+VERSION = "1.2.0"
+
 # ── Defaults (callers may override per call) ──────────────────────────────────
 
 MAX_LOGS      = 5000
@@ -288,6 +290,7 @@ def fetch_newest_log_dt(
     poll_interval: float = POLL_INTERVAL,
     poll_timeout: float  = POLL_TIMEOUT,
     http_timeout: float  = HTTP_TIMEOUT,
+    verbose: bool = False,
 ) -> datetime.datetime | None:
     """
     Return the receive_time of the newest available traffic log entry.
@@ -305,7 +308,7 @@ def fetch_newest_log_dt(
         if job_id is None:
             return None
 
-        result_xml = _poll_job(job_id, poll_interval, poll_timeout, http_timeout)
+        result_xml = _poll_job(job_id, poll_interval, poll_timeout, http_timeout, verbose)
         if result_xml is None:
             return None
 
@@ -333,6 +336,7 @@ def fetch_oldest_log_dt(
     poll_interval: float = POLL_INTERVAL,
     poll_timeout: float  = POLL_TIMEOUT,
     http_timeout: float  = HTTP_TIMEOUT,
+    verbose: bool = False,
 ) -> datetime.datetime | None:
     """
     Return the receive_time of the oldest available traffic log entry.
@@ -350,7 +354,7 @@ def fetch_oldest_log_dt(
         if job_id is None:
             return None
 
-        result_xml = _poll_job(job_id, poll_interval, poll_timeout, http_timeout)
+        result_xml = _poll_job(job_id, poll_interval, poll_timeout, http_timeout, verbose)
         if result_xml is None:
             return None
 

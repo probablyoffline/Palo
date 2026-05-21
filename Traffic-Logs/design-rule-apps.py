@@ -64,7 +64,7 @@ requests.packages.urllib3.disable_warnings()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-__version__ = "1.5.1"
+__version__ = "1.6.0"
 
 APP_REVIEW_THRESHOLD = 10  # flag designs with this many or more usable apps
 
@@ -562,6 +562,44 @@ def build_tag_update_row(rule_name: str, tag: str, device_group: str) -> dict:
     }
 
 
+def build_app_update_row(rule_name: str, apps: list[str], device_group: str) -> dict:
+    return {
+        "type":             "app_update",
+        "device_group":     device_group,
+        "rule_name":        f"APP-ID-{rule_name}",
+        "clone_above":      "",
+        "description":      "",
+        "tags":             "",
+        "source_zones":     "",
+        "source_addresses": "",
+        "source_user":      "",
+        "dest_zones":       "",
+        "dest_addresses":   "",
+        "applications":     "|".join(apps),
+        "service":          "",
+        "action":           "",
+        "group_profile":    "",
+        "tags_to_add":      "",
+    }
+
+
+def format_app_update_design(
+    design_number: int,
+    rule_name:     str,
+    usable_apps:   list[str],
+    device_group:  str,
+) -> str:
+    return "\n".join([
+        f"Design {design_number}",
+        "",
+        f"In {device_group}",
+        f"Action: Add applications",
+        f"Rule Name: APP-ID-{rule_name}",
+        f"Applications: {_csv_list(usable_apps)}",
+        "Note: additive — existing apps in the rule are preserved",
+    ])
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -592,6 +630,11 @@ def main() -> None:
     parser.add_argument(
         "--no-csv", action="store_true",
         help="Skip the structured CSV output; generate text design file only",
+    )
+    parser.add_argument(
+        "--update-existing", action="store_true", dest="update_existing",
+        help="For rules where APP-ID-<name> already exists, generate an app_update design"
+             " (adds apps from this run to the existing rule) instead of skipping",
     )
     parser.add_argument(
         "--app-review-threshold", metavar="N", type=int, dest="app_review_threshold",
@@ -695,11 +738,12 @@ def main() -> None:
     designs: list[str] = []
     csv_rows: list[dict] = []
     notes: list[str] = []
-    design_count      = 0
-    new_rule_count    = 0
+    design_count       = 0
+    new_rule_count     = 0
     unknown_rule_count = 0
-    update_count      = 0
-    unused_count      = 0
+    app_update_count   = 0
+    update_count       = 0
+    unused_count       = 0
 
     for row in rows:
         rule_name = row.get("rule", "").strip()
@@ -753,12 +797,17 @@ def main() -> None:
         generate_unknown = bool(unknown_apps) and not unknown_exists
 
         # Pre-assign design numbers for every block this rule will produce
-        known_num   = None
-        unknown_num = None
+        known_num      = None
+        unknown_num    = None
+        app_update_num = None
         if generate_known:
             design_count += 1
             known_num = design_count
             new_rule_count += 1
+        elif known_exists and usable_apps and args.update_existing:
+            design_count += 1
+            app_update_num = design_count
+            app_update_count += 1
         if generate_unknown:
             design_count += 1
             unknown_num = design_count
@@ -768,17 +817,23 @@ def main() -> None:
         update_count += 1
 
         # Notes — (prefix, message) tuples; rendered with aligned columns
-        first_num = known_num if known_num is not None else (unknown_num if unknown_num is not None else update_num)
+        first_num = known_num if known_num is not None else (app_update_num if app_update_num is not None else (unknown_num if unknown_num is not None else update_num))
         if not config.found:
             notes.append((
                 f"Design {first_num} — {rule_name}",
                 "rule was not found in Panorama config — zone, address, and profile fields are empty.",
             ))
         if known_exists and usable_apps:
-            notes.append((
-                f"Design {update_num} — {rule_name}",
-                f"APP-ID-{rule_name} already exists — new rule design skipped.",
-            ))
+            if args.update_existing:
+                notes.append((
+                    f"Design {app_update_num} — {rule_name}",
+                    f"APP-ID-{rule_name} already exists — app_update design generated to add/confirm apps.",
+                ))
+            else:
+                notes.append((
+                    f"Design {update_num} — {rule_name}",
+                    f"APP-ID-{rule_name} already exists — new rule design skipped. Use --update-existing to generate an app_update.",
+                ))
         if unknown_exists and unknown_apps:
             notes.append((
                 f"Design {update_num} — {rule_name}",
@@ -818,6 +873,13 @@ def main() -> None:
                 device_group   = device_group,
                 run_month_year = run_month_year,
             ))
+        elif app_update_num is not None:
+            designs.append(format_app_update_design(
+                design_number = app_update_num,
+                rule_name     = rule_name,
+                usable_apps   = usable_apps,
+                device_group  = device_group,
+            ))
         if generate_unknown:
             designs.append(format_unknown_rule_design(
                 design_number  = unknown_num,
@@ -832,7 +894,7 @@ def main() -> None:
         designs.append(format_rule_update(update_num, rule_name, TAG_UNDER_REVIEW, device_group, run_month_year))
 
         if not args.no_csv:
-            if usable_apps:
+            if generate_known and usable_apps:
                 csv_rows.append(build_new_rule_row(
                     rule_name      = rule_name,
                     config         = config,
@@ -842,6 +904,8 @@ def main() -> None:
                     device_group   = device_group,
                     run_month_year = run_month_year,
                 ))
+            elif app_update_num is not None:
+                csv_rows.append(build_app_update_row(rule_name, usable_apps, device_group))
             if has_unknown:
                 unknown_rule_name = f"APP-ID-{rule_name}-UNKNOWN" if usable_apps else f"APP-ID-{rule_name}"
                 ports = [p.strip() for p in ports_raw.split("|") if p.strip()]
@@ -881,10 +945,11 @@ def main() -> None:
         "",
         f"Designs     : {design_count} total"
         f" — {total_new} new rule(s)"
+        f", {app_update_count} app update(s)"
         f", {update_count} tag update(s)"
         f", {unused_count} unused (no traffic)",
         f"Duplicates  : {existing_app_ids} existing APP-ID rule(s) detected"
-        + (" — skipped" if existing_app_ids else " — none"),
+        + (" — skipped" if existing_app_ids and not args.update_existing else (" — app_update generated" if existing_app_ids and args.update_existing else " — none")),
     ]
     preamble = ["\n".join(summary_lines)]
 
@@ -909,7 +974,7 @@ def main() -> None:
 
     print("=" * 62)
     print(f"  {design_count} design(s) total")
-    print(f"  {total_new} new rule(s)  |  {update_count} tag update(s)  |  {unused_count} unused (no traffic)")
+    print(f"  {total_new} new rule(s)  |  {app_update_count} app update(s)  |  {update_count} tag update(s)  |  {unused_count} unused (no traffic)")
     print(f"  Text : {txt_path}")
     if not args.no_csv:
         print(f"  CSV  : {csv_path}")
