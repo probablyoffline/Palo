@@ -68,7 +68,7 @@ requests.packages.urllib3.disable_warnings()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-__version__ = "1.7.0"
+__version__ = "1.7.1"
 
 APP_REVIEW_THRESHOLD = 10  # flag designs with this many or more usable apps
 
@@ -79,7 +79,7 @@ RISKY_APPS_FILE     = SCRIPT_DIR / "risky-apps.txt"
 
 DEFAULT_RISKY_APPS = frozenset({"ssh", "ms-rdp", "telnet", "ftp", "tftp"})
 
-NON_APP_VALUES     = frozenset({"incomplete", "not-applicable"})
+NON_APP_VALUES     = frozenset({"incomplete", "not-applicable", "insufficient-data"})
 UNKNOWN_APP_VALUES = frozenset({"unknown-tcp", "unknown-udp"})
 
 TAG_NEW_RULE     = "app-id-new-rule"
