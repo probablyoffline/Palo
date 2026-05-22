@@ -25,7 +25,11 @@ Config files (auto-read from the same directory as this script):
   standard-ports.txt  — fallback used when --static-ports is set or API is unavailable.
 
 Usage:
-    python design-rule-apps.py <input_csv> [options]
+    python design-rule-apps.py <input_csv> [<input_csv> ...] [options]
+
+    Multiple CSVs are accepted; app lists are unioned per rule across all files.
+    Use this when accumulating several get-rule-apps.py runs before implementing,
+    or to catch up on missed intermediate updates in one design pass.
 
 Options:
     --device-group NAME / --dg NAME   Override device group (Panorama mode only)
@@ -64,7 +68,7 @@ requests.packages.urllib3.disable_warnings()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-__version__ = "1.6.0"
+__version__ = "1.7.0"
 
 APP_REVIEW_THRESHOLD = 10  # flag designs with this many or more usable apps
 
@@ -600,13 +604,97 @@ def format_app_update_design(
     ])
 
 
+# ── CSV merge ─────────────────────────────────────────────────────────────────
+
+def merge_csv_rows(all_rows: list[list[dict]]) -> list[dict]:
+    """Union app/port lists per rule across multiple get-rule-apps.py CSVs.
+
+    complete=yes if any run has complete=yes (one clean run clears the flag).
+    complete=skipped only if every run reported skipped.
+    entries_scanned and windows_queried are summed across runs.
+    Rule order follows first appearance across the files.
+    """
+    merged: dict[str, dict] = {}
+    rule_order: list[str] = []
+
+    for rows in all_rows:
+        for row in rows:
+            rule = row.get("rule", "").strip()
+            if not rule:
+                continue
+            if rule not in merged:
+                rule_order.append(rule)
+                merged[rule] = {
+                    "apps":            set(),
+                    "ports":           set(),
+                    "entries_scanned": 0,
+                    "windows_queried": 0,
+                    "complete":        "",
+                    "data_source":     set(),
+                }
+            m = merged[rule]
+
+            for app in (row.get("apps", "") or "").split("|"):
+                a = app.strip()
+                if a:
+                    m["apps"].add(a)
+
+            for port in (row.get("ports", "") or "").split("|"):
+                p = port.strip()
+                if p:
+                    m["ports"].add(p)
+
+            complete = (row.get("complete", "") or "").strip().lower()
+            if complete == "yes":
+                m["complete"] = "yes"
+            elif complete == "no" and m["complete"] != "yes":
+                m["complete"] = "no"
+            elif complete == "skipped" and m["complete"] == "":
+                m["complete"] = "skipped"
+
+            try:
+                m["entries_scanned"] += int(row.get("entries_scanned") or 0)
+            except (ValueError, TypeError):
+                pass
+            try:
+                m["windows_queried"] += int(row.get("windows_queried") or 0)
+            except (ValueError, TypeError):
+                pass
+
+            ds = (row.get("data_source", "") or "").strip()
+            if ds:
+                m["data_source"].add(ds)
+
+    result = []
+    for rule in rule_order:
+        m = merged[rule]
+        apps_sorted  = sorted(m["apps"])
+        ports_sorted = sorted(m["ports"])
+        result.append({
+            "rule":            rule,
+            "app_count":       str(len(apps_sorted)),
+            "apps":            "|".join(apps_sorted),
+            "port_count":      str(len(ports_sorted)),
+            "ports":           "|".join(ports_sorted),
+            "entries_scanned": str(m["entries_scanned"]),
+            "windows_queried": str(m["windows_queried"]),
+            "complete":        m["complete"] or "no",
+            "data_source":     "|".join(sorted(m["data_source"])),
+        })
+
+    return result
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Generate App-ID rule designs from get-rule-apps.py CSV output."
     )
-    parser.add_argument("input_csv", help="CSV file produced by get-rule-apps.py")
+    parser.add_argument(
+        "input_csvs", nargs="+", metavar="input_csv",
+        help="One or more CSV files from get-rule-apps.py; app lists are unioned per rule",
+    )
     parser.add_argument(
         "--device-group", "--dg", metavar="NAME", dest="device_group",
         help="Override device group for rule config lookups (Panorama mode only)",
@@ -650,8 +738,11 @@ def main() -> None:
     run_dt         = datetime.datetime.now()
     run_month_year = run_dt.strftime("%B %Y")
     timestamp      = run_dt.strftime("%Y%m%d-%H%M%S")
-    input_stem     = Path(args.input_csv).stem
-    output_stem    = args.output or f"Output/rule-design-{input_stem}-{timestamp}"
+    if len(args.input_csvs) == 1:
+        input_stem  = Path(args.input_csvs[0]).stem
+        output_stem = args.output or f"Output/rule-design-{input_stem}-{timestamp}"
+    else:
+        output_stem = args.output or f"Output/rule-design-merged-{timestamp}"
     Path(output_stem).parent.mkdir(parents=True, exist_ok=True)
 
     txt_path = f"{output_stem}.txt"
@@ -662,7 +753,12 @@ def main() -> None:
     print("=" * 62)
     print(f"  design-rule-apps  v{__version__}")
     print("=" * 62)
-    print(f"  Input       : {args.input_csv}")
+    if len(args.input_csvs) == 1:
+        print(f"  Input       : {args.input_csvs[0]}")
+    else:
+        print(f"  Inputs      : {len(args.input_csvs)} CSV files (merged)")
+        for f in args.input_csvs:
+            print(f"                {f}")
     print(f"  Target      : {ops_lib.TARGET_HOST}  ({ops_lib.mode_summary()})")
     print(f"  Port mode   : {port_mode}")
     print(f"  Output .txt : {txt_path}")
@@ -680,15 +776,26 @@ def main() -> None:
 
     print()
 
-    try:
-        with open(args.input_csv, newline="", encoding="utf-8") as fh:
-            rows = list(csv.DictReader(fh))
-    except FileNotFoundError:
-        print(f"Error: input file not found: {args.input_csv}", file=sys.stderr)
+    all_csv_rows: list[list[dict]] = []
+    for csv_path_in in args.input_csvs:
+        try:
+            with open(csv_path_in, newline="", encoding="utf-8") as fh:
+                file_rows = list(csv.DictReader(fh))
+        except FileNotFoundError:
+            print(f"Error: input file not found: {csv_path_in}", file=sys.stderr)
+            sys.exit(1)
+        if not file_rows:
+            print(f"Warning: no rows in {csv_path_in} — skipping", file=sys.stderr)
+            continue
+        all_csv_rows.append(file_rows)
+
+    if not all_csv_rows:
+        print("No rows found in any input CSV.", file=sys.stderr)
         sys.exit(1)
 
+    rows = merge_csv_rows(all_csv_rows)
     if not rows:
-        print("No rows found in input CSV.", file=sys.stderr)
+        print("No rows found after merging input CSVs.", file=sys.stderr)
         sys.exit(1)
 
     rule_names = [r["rule"] for r in rows if r.get("rule")]
@@ -941,7 +1048,8 @@ def main() -> None:
         f"Generated   : {run_dt.strftime('%Y-%m-%d %H:%M:%S')}",
         f"Script      : design-rule-apps.py v{__version__}",
         f"Device group: {device_group}",
-        f"Input       : {args.input_csv}",
+        (f"Input       : {args.input_csvs[0]}" if len(args.input_csvs) == 1
+         else f"Input       : {len(args.input_csvs)} files merged ({', '.join(args.input_csvs)})"),
         "",
         f"Designs     : {design_count} total"
         f" — {total_new} new rule(s)"
