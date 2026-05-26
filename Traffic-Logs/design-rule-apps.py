@@ -69,7 +69,7 @@ requests.packages.urllib3.disable_warnings()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-__version__ = "1.8.0"
+__version__ = "1.9.0"
 
 APP_REVIEW_THRESHOLD     = 10  # flag designs with this many or more usable apps
 PORT_INFERENCE_THRESHOLD = 3   # infer app from port only when ≤ this many apps claim it
@@ -1014,8 +1014,9 @@ def main() -> None:
     print()
 
     device_group           = ops_lib.DEVICE_GROUP
-    designs: list[str]     = []
-    csv_rows: list[dict]   = []
+    new_rule_designs: list[str] = []
+    update_designs:  list[str] = []
+    csv_rows: list[dict]        = []
     notes: list[str]       = []
     design_count           = 0
     new_rule_count         = 0
@@ -1097,7 +1098,7 @@ def main() -> None:
         if complete == "skipped" or has_no_apps:
             design_count += 1
             unused_count += 1
-            designs.append(format_unused_design(design_count, rule_name, device_group, run_month_year))
+            update_designs.append(format_unused_design(design_count, rule_name, device_group, run_month_year))
             if not args.no_csv:
                 csv_rows.append(build_tag_update_row(rule_name, TAG_UNUSED, device_group))
             continue
@@ -1269,7 +1270,7 @@ def main() -> None:
 
         # ── Generate design blocks ────────────────────────────────────────────
         if generate_known:
-            designs.append(format_new_rule_design(
+            new_rule_designs.append(format_new_rule_design(
                 design_number  = known_num,
                 rule_name      = rule_name,
                 config         = config,
@@ -1280,7 +1281,7 @@ def main() -> None:
                 run_month_year = run_month_year,
             ))
         elif app_update_num is not None:
-            designs.append(format_app_update_design(
+            update_designs.append(format_app_update_design(
                 design_number = app_update_num,
                 rule_name     = rule_name,
                 usable_apps   = main_apps,
@@ -1288,7 +1289,7 @@ def main() -> None:
             ))
 
         if generate_unknown:
-            designs.append(format_unknown_rule_design(
+            new_rule_designs.append(format_unknown_rule_design(
                 design_number  = unknown_num,
                 rule_name      = rule_name,
                 config         = config,
@@ -1301,7 +1302,7 @@ def main() -> None:
 
         if generate_nonstandard:
             nonst_ports_sorted = sorted(nonst_ports)
-            designs.append(format_nonstandard_rule_design(
+            new_rule_designs.append(format_nonstandard_rule_design(
                 design_number  = nonstandard_num,
                 rule_name      = rule_name,
                 config         = config,
@@ -1311,7 +1312,7 @@ def main() -> None:
                 run_month_year = run_month_year,
             ))
         elif nonstandard_upd_num is not None:
-            designs.append(format_app_update_design(
+            update_designs.append(format_app_update_design(
                 design_number = nonstandard_upd_num,
                 rule_name     = rule_name,
                 usable_apps   = nonst_apps,
@@ -1319,7 +1320,7 @@ def main() -> None:
                 rule_suffix   = "-NONSTANDARD",
             ))
 
-        designs.append(format_rule_update(update_num, rule_name, TAG_UNDER_REVIEW, device_group, run_month_year))
+        update_designs.append(format_rule_update(update_num, rule_name, TAG_UNDER_REVIEW, device_group, run_month_year))
 
         # ── CSV rows ──────────────────────────────────────────────────────────
         if not args.no_csv:
@@ -1424,8 +1425,12 @@ def main() -> None:
             note_lines.append(f"{prefix.ljust(pad)}: {message}")
         preamble.append("\n".join(note_lines))
 
-    designs_block = f"DESIGNS\n{SEP}\n\n" + "\n\n---\n\n".join(designs)
-    text_output = "\n\n\n".join(preamble + [designs_block])
+    sections = []
+    if new_rule_designs:
+        sections.append(f"NEW RULES\n{SEP}\n\n" + "\n\n---\n\n".join(new_rule_designs))
+    if update_designs:
+        sections.append(f"RULE UPDATES\n{SEP}\n\n" + "\n\n---\n\n".join(update_designs))
+    text_output = "\n\n\n".join(preamble + sections)
 
     with open(txt_path, "w", encoding="utf-8") as fh:
         fh.write(text_output + "\n")
