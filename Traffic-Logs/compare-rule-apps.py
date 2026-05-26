@@ -29,6 +29,7 @@ Options:
                            (default: Output/rule-delta-TIMESTAMP.txt)
     --gone                 Include "apps no longer seen" sections (hidden by default)
     --show-unchanged       Include rules with no changes in the delta section
+    --no-port-details      Suppress new port observation details in the delta section
 
 Auto-discovery groups:
     Files are grouped by the stem extracted from the filename
@@ -44,7 +45,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 # Matches: rule-apps-{stem}-{YYYYMMDD}-{HHMMSS}.csv
 # Greedy backtracking on (.+) ensures the LAST date-like suffix is the timestamp.
@@ -65,6 +66,7 @@ class RunData:
     apps_by_rule:   dict[str, frozenset]       # {rule: frozenset(app_names)}
     status_by_rule: dict[str, str]             # {rule: 'yes'|'no'|'skipped'}
     rule_order:     list[str]                  # rules in CSV order
+    ports_by_rule:  dict[str, frozenset]       # {rule: frozenset("app:port" pairs)}
 
 
 # ── Loaders ───────────────────────────────────────────────────────────────────
@@ -124,6 +126,7 @@ def load_run(csv_path: str) -> RunData | None:
     apps_by_rule:   dict[str, frozenset] = {}
     status_by_rule: dict[str, str]       = {}
     rule_order:     list[str]            = []
+    ports_by_rule:  dict[str, frozenset] = {}
 
     for row in rows:
         rule = row.get("rule", "").strip()
@@ -136,6 +139,13 @@ def load_run(csv_path: str) -> RunData | None:
         status_by_rule[rule] = complete
         rule_order.append(rule)
 
+        port_pairs_raw = row.get("app_port_details", "").strip()
+        pairs = frozenset(
+            p.strip() for p in port_pairs_raw.split("|")
+            if p.strip() and ":" in p
+        )
+        ports_by_rule[rule] = pairs
+
     return RunData(
         csv_path       = str(csv_path),
         stem           = stem,
@@ -145,6 +155,7 @@ def load_run(csv_path: str) -> RunData | None:
         apps_by_rule   = apps_by_rule,
         status_by_rule = status_by_rule,
         rule_order     = rule_order,
+        ports_by_rule  = ports_by_rule,
     )
 
 
@@ -179,6 +190,7 @@ def _generate_group_report(
     stem:             str,
     show_gone:        bool,
     show_unchanged:   bool,
+    show_ports:       bool = True,
 ) -> list[str]:
     """Return lines for one stem group."""
     SEP  = "=" * 62
@@ -265,10 +277,12 @@ def _generate_group_report(
         h()
 
     # Compute per-rule deltas
-    rules_with_new:  list[tuple[str, frozenset, frozenset]] = []  # (rule, new_apps, gone_apps)
-    rules_with_gone: list[tuple[str, frozenset]]            = []  # (rule, gone_apps)
-    rules_unchanged: list[str]                              = []
-    rules_skipped:   list[str]                              = []
+    # Each tuple: (rule, new_apps, gone_apps, new_port_pairs)
+    rules_with_new:       list[tuple[str, frozenset, frozenset, frozenset]] = []
+    rules_with_new_ports: list[tuple[str, frozenset]]                       = []  # ports only, no new apps
+    rules_with_gone:      list[tuple[str, frozenset]]                       = []
+    rules_unchanged:      list[str]                                         = []
+    rules_skipped:        list[str]                                         = []
 
     # Use current run's rule order as canonical; fall back to previous
     ordered = curr_run.rule_order or prev_run.rule_order
@@ -278,20 +292,26 @@ def _generate_group_report(
         curr_apps   = curr_run.apps_by_rule.get(rule, frozenset())
         prev_status = prev_run.status_by_rule.get(rule, "")
         curr_status = curr_run.status_by_rule.get(rule, "")
+        prev_ports  = prev_run.ports_by_rule.get(rule, frozenset())
+        curr_ports  = curr_run.ports_by_rule.get(rule, frozenset())
 
-        new_apps  = curr_apps - prev_apps
-        gone_apps = prev_apps - curr_apps
+        new_apps        = curr_apps  - prev_apps
+        gone_apps       = prev_apps  - curr_apps
+        new_port_pairs  = curr_ports - prev_ports
 
         if curr_status == "skipped" and prev_status == "skipped":
             rules_skipped.append(rule)
         elif new_apps:
-            rules_with_new.append((rule, new_apps, gone_apps))
+            rules_with_new.append((rule, new_apps, gone_apps, new_port_pairs))
+        elif new_port_pairs:
+            rules_with_new_ports.append((rule, new_port_pairs))
         elif gone_apps:
             rules_with_gone.append((rule, gone_apps))
         else:
             rules_unchanged.append(rule)
 
     h(f"  Rules with NEW apps        : {len(rules_with_new)}")
+    h(f"  Rules with new port obs    : {len(rules_with_new_ports)}  (same apps, new port activity)")
     h(f"  Rules unchanged            : {len(rules_unchanged)}")
     h(f"  Rules with apps gone       : {len(rules_with_gone)}  (likely captured by APP-ID rules)")
     h(f"  Rules skipped/inactive     : {len(rules_skipped)}")
@@ -301,18 +321,34 @@ def _generate_group_report(
         h(DASH)
         h("  New apps found since last run:")
         h(DASH)
-        for rule, new_apps, gone_apps in rules_with_new:
+        for rule, new_apps, gone_apps, new_port_pairs in rules_with_new:
             h(f"  Rule: {rule}")
             for app in sorted(new_apps):
                 h(f"    + {app}")
             if show_gone and gone_apps:
                 for app in sorted(gone_apps):
                     h(f"    - {app}  (no longer seen)")
+            if show_ports and new_port_pairs:
+                h(f"    New port obs: {', '.join(sorted(new_port_pairs))}")
+                h( "    Note: new port observations may indicate a NONSTANDARD rule is needed.")
+                h( "          Run design-rule-apps.py (with --update-existing if APP-ID rules exist).")
             h()
     else:
         h(DASH)
         h("  No new apps found since last run.")
         h(DASH)
+        h()
+
+    if show_ports and rules_with_new_ports:
+        h(DASH)
+        h("  Rules with new port observations (same apps, new port activity):")
+        h(DASH)
+        for rule, new_port_pairs in rules_with_new_ports:
+            h(f"  Rule: {rule}")
+            h(f"    New port obs: {', '.join(sorted(new_port_pairs))}")
+            h( "    Note: may indicate a NONSTANDARD rule is needed.")
+            h( "          Run design-rule-apps.py (with --update-existing if APP-ID rules exist).")
+            h()
         h()
 
     if show_gone and rules_with_gone:
@@ -426,6 +462,10 @@ def main() -> None:
         "--show-unchanged", action="store_true",
         help="Include rules with no changes in the delta section",
     )
+    parser.add_argument(
+        "--no-port-details", action="store_true",
+        help="Suppress new port observation details in the delta section",
+    )
     args = parser.parse_args()
 
     run_dt    = datetime.datetime.now()
@@ -481,6 +521,7 @@ def main() -> None:
             stem           = stem,
             show_gone      = args.gone,
             show_unchanged = args.show_unchanged,
+            show_ports     = not args.no_port_details,
         )
         all_lines.extend(group_lines)
         all_lines.append("")

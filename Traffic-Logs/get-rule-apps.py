@@ -66,7 +66,7 @@ import ops_lib        # noqa: E402
 import log_query_lib  # noqa: E402
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-VERSION              = "1.5.2"
+VERSION              = "1.5.3"
 
 DAYS_BACK            = 7
 MAX_LOGS             = 5000
@@ -83,7 +83,7 @@ PARALLEL = False  # set to True when workers > 1; suppresses per-window prints
 _print_lock = threading.Lock()
 _csv_lock   = threading.Lock()
 
-CSV_FIELDNAMES = ["rule", "app_count", "apps", "port_count", "ports", "entries_scanned", "windows_queried", "complete", "data_source"]
+CSV_FIELDNAMES = ["rule", "app_count", "apps", "port_count", "ports", "app_port_details", "entries_scanned", "windows_queried", "complete", "data_source"]
 
 requests.packages.urllib3.disable_warnings()
 
@@ -337,20 +337,21 @@ def _process_rule(
                 f"review this rule before splitting"
             )
         row = {
-            "rule":            rule_name,
-            "app_count":       len(stats_apps),
-            "apps":            "|".join(sorted(stats_apps)),
-            "port_count":      len(services),
-            "ports":           "|".join(services),
-            "entries_scanned": 0,
-            "windows_queried": 0,
-            "complete":        "yes",
-            "data_source":     "stats",
+            "rule":             rule_name,
+            "app_count":        len(stats_apps),
+            "apps":             "|".join(sorted(stats_apps)),
+            "port_count":       len(services),
+            "ports":            "|".join(services),
+            "app_port_details": "",
+            "entries_scanned":  0,
+            "windows_queried":  0,
+            "complete":         "yes",
+            "data_source":      "stats",
         }
         return row, "\n".join(lines)
 
     # ── Log query path ────────────────────────────────────────────────────────
-    all_apps, total_entries, complete, queries_used = log_query_lib.collect_apps(
+    all_apps, app_port_details, total_entries, complete, queries_used = log_query_lib.collect_apps(
         rule_name, start_dt, end_dt, action,
         max_queries  = max_queries,
         max_logs     = MAX_LOGS,
@@ -384,16 +385,22 @@ def _process_rule(
             f"review this rule before splitting"
         )
 
+    pairs = sorted(
+        f"{app}:{port}"
+        for app, ports in app_port_details.items()
+        for port in sorted(ports)
+    )
     row = {
-        "rule":            rule_name,
-        "app_count":       len(all_apps),
-        "apps":            "|".join(sorted(all_apps)),
-        "port_count":      len(services),
-        "ports":           "|".join(services),
-        "entries_scanned": total_entries,
-        "windows_queried": queries_used,
-        "complete":        "yes" if complete else "no",
-        "data_source":     "logs",
+        "rule":             rule_name,
+        "app_count":        len(all_apps),
+        "apps":             "|".join(sorted(all_apps)),
+        "port_count":       len(services),
+        "ports":            "|".join(services),
+        "app_port_details": "|".join(pairs),
+        "entries_scanned":  total_entries,
+        "windows_queried":  queries_used,
+        "complete":         "yes" if complete else "no",
+        "data_source":      "logs",
     }
     return row, "\n".join(lines)
 
@@ -723,15 +730,16 @@ def main() -> None:
                     )
                     svc = services_map.get(rule_name, [])
                     row = {
-                        "rule":            rule_name,
-                        "app_count":       0,
-                        "apps":            "",
-                        "port_count":      len(svc),
-                        "ports":           "|".join(svc),
-                        "entries_scanned": 0,
-                        "windows_queried": 0,
-                        "complete":        "skipped",
-                        "data_source":     "",
+                        "rule":             rule_name,
+                        "app_count":        0,
+                        "apps":             "",
+                        "port_count":       len(svc),
+                        "ports":            "|".join(svc),
+                        "app_port_details": "",
+                        "entries_scanned":  0,
+                        "windows_queried":  0,
+                        "complete":         "skipped",
+                        "data_source":      "",
                     }
                     _write_row(writer, fh, row)
                     run_results.append(row)

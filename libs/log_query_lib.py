@@ -18,7 +18,7 @@ Both functions read TARGET_HOST and API_KEY from ops_lib.
 Example — find all apps for a rule:
 
     import log_query_lib
-    apps, total, complete, rounds = log_query_lib.collect_apps(
+    apps, app_port_details, total, complete, rounds = log_query_lib.collect_apps(
         rule_name="Allow Any",
         start_dt=datetime(2026, 5, 5),
         end_dt=datetime(2026, 5, 12),
@@ -47,7 +47,15 @@ import ops_lib  # noqa — expected to be on sys.path by the calling script
 requests.packages.urllib3.disable_warnings()
 
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
+
+# ── Protocol mapping for dport extraction ─────────────────────────────────────
+# Handles both numeric IP protocol numbers and text forms returned by different
+# PAN-OS versions.
+_PROTO_MAP: dict[str, str] = {
+    "6": "tcp", "17": "udp",
+    "tcp": "tcp", "udp": "udp",
+}
 
 # ── Defaults (callers may override per call) ──────────────────────────────────
 
@@ -232,7 +240,7 @@ def collect_apps(
     verbose: bool  = False,
     parallel: bool = False,
     query_delay: float = 0,
-) -> tuple[set[str], int, bool, int]:
+) -> tuple[set[str], dict[str, set[str]], int, bool, int]:
     """
     Find all distinct apps for a rule using iterative app-exclusion.
 
@@ -241,17 +249,23 @@ def collect_apps(
     For a rule with N distinct apps this typically completes in N+1 queries
     regardless of traffic volume.
 
-    Returns (apps, total_entries, complete, queries_used).
-    complete=False only if the query budget (max_queries) runs out or a
-    query fails before all apps are found.
+    Returns (apps, app_port_details, total_entries, complete, queries_used).
+      apps             — set of all distinct app names found
+      app_port_details — {app: set of 'tcp-N'/'udp-N' strings} built from
+                         dport + proto fields in each entry; used by callers
+                         to detect non-standard port usage per app
+      total_entries    — total log entries scanned across all rounds
+      complete         — False only if query budget runs out or a query fails
+      queries_used     — number of API queries executed
     """
-    all_apps     = set()
-    total        = 0
-    queries_used = 0
+    all_apps:         set[str]               = set()
+    all_app_ports:    dict[str, set[str]]    = {}
+    total:            int                    = 0
+    queries_used:     int                    = 0
 
     while True:
         if queries_used >= max_queries:
-            return all_apps, total, False, queries_used
+            return all_apps, all_app_ports, total, False, queries_used
 
         exclude = all_apps if all_apps else None
 
@@ -259,7 +273,7 @@ def collect_apps(
             excl_note = f"excl: {len(all_apps):2}" if all_apps else "no exclusions"
             print(f"  round {queries_used + 1:2}  {excl_note} ...", end="  ", flush=True)
 
-        apps, _entries, count, capped, ok = query_window(
+        apps, entries, count, capped, ok = query_window(
             rule_name, start_dt, end_dt, action,
             exclude_apps  = exclude,
             max_logs      = max_logs,
@@ -274,13 +288,22 @@ def collect_apps(
             print(f"{count} entries" if ok else "error", flush=True)
 
         if not ok:
-            return all_apps, total, False, queries_used
+            return all_apps, all_app_ports, total, False, queries_used
+
+        # Accumulate per-app destination port observations
+        for e in entries:
+            app   = e.findtext("app") or ""
+            dport = e.findtext("dport") or ""
+            proto = (e.findtext("proto") or "").strip().lower()
+            proto_str = _PROTO_MAP.get(proto)
+            if app and dport and proto_str and dport.isdigit():
+                all_app_ports.setdefault(app, set()).add(f"{proto_str}-{dport}")
 
         total    += count
         all_apps |= apps
 
         if count == 0 or not capped:
-            return all_apps, total, True, queries_used
+            return all_apps, all_app_ports, total, True, queries_used
 
         if query_delay > 0:
             time.sleep(query_delay)
