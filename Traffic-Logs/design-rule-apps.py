@@ -5,6 +5,7 @@ Reads a CSV produced by get-rule-apps.py, fetches full rule config from Panorama
 and outputs:
   - A .txt file: formatted text designs for documentation and approval
   - A .csv file: structured data for future scripted implementation
+  - A -pci.csv file (when flags-pci.txt is present): PCI-scoped designs only
 
 Port standard determination (default — dynamic mode):
   For each rule, the script queries Panorama's app-id database to get the official
@@ -13,16 +14,26 @@ Port standard determination (default — dynamic mode):
     - If all current ports are standard for the observed apps → new rule uses
       application-default, no app-id-non-standard tag.
     - If any port is not standard for any of the observed apps → new rule lists
-      all ports explicitly, app-id-non-standard tag added.
+      all ports explicitly, separate APP-ID-<name>-NONSTANDARD rule generated.
   This reflects Palo Alto's own definition of what is standard — not a static list.
 
   Use --static-ports to disable dynamic lookup and fall back to standard-ports.txt.
   Dynamic lookup also falls back to standard-ports.txt automatically if the API
   call fails.
 
+PCI rule splitting:
+  When flags-pci.txt is present, any rule whose existing Panorama tags include one
+  of the listed tag names is treated as a PCI rule.  PCI rules are separated into
+  their own numbered sequence (PCI-1, PCI-2, …) and their own sections in the .txt
+  file (PCI — NEW RULES / PCI — RULE UPDATES).  Their CSV rows are written to a
+  separate -pci.csv file.  If flags-pci.txt is absent, PCI splitting is silently
+  disabled and the script behaves exactly as before.
+
 Config files (auto-read from the same directory as this script):
   risky-apps.txt      — one app name per line.  Matching apps add the risky-app tag.
   standard-ports.txt  — fallback used when --static-ports is set or API is unavailable.
+  flags-pci.txt       — one Panorama tag name per line.  Rules tagged with any of
+                        these are separated into the PCI output stream.
 
 Usage:
     python design-rule-apps.py <input_csv> [<input_csv> ...] [options]
@@ -37,15 +48,29 @@ Options:
     --static-ports                    Skip dynamic app-id lookup; use standard-ports.txt
     --standard-ports FILE             Override the default standard-ports.txt path
     --risky-apps FILE                 Override the default risky-apps.txt path
+    --pci-flags FILE                  Override the default flags-pci.txt path
     --no-csv                          Skip the structured CSV output, text only
+    --update-existing                 Generate app_update designs for rules where
+                                      APP-ID-<name> already exists (adds new apps)
+    --app-review-threshold N          Flag designs with ≥ N apps for manual review
+                                      (default: 10)
+
+Output .txt sections (in order):
+    SUMMARY          — counters, file paths, PCI breakdown (if applicable)
+    NOTES            — per-design warnings (inferred apps, dropped ports, etc.)
+    NEW RULES        — APP-ID-*, APP-ID-*-UNKNOWN, APP-ID-*-NONSTANDARD creations
+    RULE UPDATES     — tag additions to existing rules (app-id-under-review, etc.)
+    PCI — NEW RULES  — same as NEW RULES, PCI-scoped rules only (if applicable)
+    PCI — RULE UPDATES — same as RULE UPDATES, PCI-scoped rules only (if applicable)
 
 Design logic:
   - Rules with apps observed → new APP-ID-<name> rule design above old rule
   - Rules with no traffic (skipped) or no apps found → tag update only
-  - unknown-tcp / unknown-udp → excluded from app list, app-id-unknown tag added
+  - unknown-tcp / unknown-udp → excluded from app list, separate UNKNOWN rule
   - incomplete / not-applicable → excluded silently
   - Risky apps → risky-app tag added
-  - Non-standard ports → ports listed explicitly, app-id-non-standard tag added
+  - Non-standard port traffic → separate APP-ID-<name>-NONSTANDARD rule
+  - Apps inferred from observed/configured ports (≤3 apps claim that port)
   - All new rules get: app-id-new-rule
   - Old rules with new rules get: app-id-under-review
   - Old rules with no traffic get: app-id-review-unused
@@ -69,7 +94,7 @@ requests.packages.urllib3.disable_warnings()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-__version__ = "1.9.0"
+__version__ = "1.10.0"
 
 APP_REVIEW_THRESHOLD     = 10  # flag designs with this many or more usable apps
 PORT_INFERENCE_THRESHOLD = 3   # infer app from port only when ≤ this many apps claim it
@@ -78,6 +103,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 
 STANDARD_PORTS_FILE = SCRIPT_DIR / "standard-ports.txt"
 RISKY_APPS_FILE     = SCRIPT_DIR / "risky-apps.txt"
+PCI_FLAGS_FILE      = SCRIPT_DIR / "flags-pci.txt"
 
 DEFAULT_RISKY_APPS = frozenset({"ssh", "ms-rdp", "telnet", "ftp", "tftp"})
 
@@ -144,6 +170,12 @@ def load_set_from_file(
                 result.add(s.lower())
     print(f"  Loaded {len(result)} entries from {path.name}")
     return result
+
+
+# ── PCI detection ────────────────────────────────────────────────────────────
+
+def is_pci_rule(config: RuleConfig, pci_tags: set[str]) -> bool:
+    return bool(pci_tags) and bool({t.lower() for t in config.existing_tags} & pci_tags)
 
 
 # ── Rule config fetch ─────────────────────────────────────────────────────────
@@ -480,7 +512,7 @@ def _csv_list(items: list[str]) -> str:
 
 
 def format_new_rule_design(
-    design_number:  int,
+    design_number:  int | str,
     rule_name:      str,
     config:         RuleConfig,
     usable_apps:    list[str],
@@ -528,7 +560,7 @@ def format_new_rule_design(
 
 
 def format_unknown_rule_design(
-    design_number:  int,
+    design_number:  int | str,
     rule_name:      str,
     config:         RuleConfig,
     unknown_apps:   list[str],
@@ -575,7 +607,7 @@ def format_unknown_rule_design(
 
 
 def format_rule_update(
-    design_number:  int,
+    design_number:  int | str,
     rule_name:      str,
     tag:            str,
     device_group:   str,
@@ -593,7 +625,7 @@ def format_rule_update(
 
 
 def format_unused_design(
-    design_number: int,
+    design_number: int | str,
     rule_name:     str,
     device_group:  str,
     run_month_year: str,
@@ -695,7 +727,7 @@ def build_app_update_row(
 
 
 def format_nonstandard_rule_design(
-    design_number:  int,
+    design_number:  int | str,
     rule_name:      str,
     config:         RuleConfig,
     nonst_apps:     list[str],
@@ -734,7 +766,7 @@ def format_nonstandard_rule_design(
 
 
 def format_app_update_design(
-    design_number: int,
+    design_number: int | str,
     rule_name:     str,
     usable_apps:   list[str],
     device_group:  str,
@@ -870,6 +902,12 @@ def main() -> None:
         help=f"Risky apps file (default: {RISKY_APPS_FILE.name} in script directory)",
     )
     parser.add_argument(
+        "--pci-flags", metavar="FILE", dest="pci_flags_file",
+        help=f"File listing Panorama tag names that identify PCI rules"
+             f" (default: {PCI_FLAGS_FILE.name} in script directory;"
+             f" omit file to disable PCI splitting)",
+    )
+    parser.add_argument(
         "--no-csv", action="store_true",
         help="Skip the structured CSV output; generate text design file only",
     )
@@ -899,8 +937,9 @@ def main() -> None:
         output_stem = args.output or f"Output/rule-design-merged-{timestamp}"
     Path(output_stem).parent.mkdir(parents=True, exist_ok=True)
 
-    txt_path = f"{output_stem}.txt"
-    csv_path = f"{output_stem}.csv"
+    txt_path     = f"{output_stem}.txt"
+    csv_path     = f"{output_stem}.csv"
+    pci_csv_path = f"{output_stem}-pci.csv"
 
     port_mode = "static (standard-ports.txt)" if args.static_ports else "dynamic (Panorama app-id database)"
 
@@ -922,6 +961,11 @@ def main() -> None:
 
     ra_path    = Path(args.risky_apps_file) if args.risky_apps_file else RISKY_APPS_FILE
     risky_apps = load_set_from_file(ra_path, default=DEFAULT_RISKY_APPS, label="risky-apps")
+
+    pf_path  = Path(args.pci_flags_file) if args.pci_flags_file else PCI_FLAGS_FILE
+    pci_tags = load_set_from_file(pf_path, default=frozenset(), label="pci-flags")
+    if pci_tags and not args.no_csv:
+        print(f"  PCI csv     : {pci_csv_path}")
 
     sp_path = Path(args.standard_ports_file) if args.standard_ports_file else STANDARD_PORTS_FILE
     static_standard_ports: set[str] = set()
@@ -1015,18 +1059,24 @@ def main() -> None:
 
     device_group           = ops_lib.DEVICE_GROUP
     new_rule_designs: list[str] = []
-    update_designs:  list[str] = []
-    csv_rows: list[dict]        = []
-    notes: list[str]       = []
-    design_count           = 0
-    new_rule_count         = 0
-    unknown_rule_count     = 0
-    nonstandard_rule_count = 0
-    app_update_count       = 0
-    update_count           = 0
-    unused_count           = 0
-    named_service_count    = 0
-    inferred_count         = 0
+    update_designs:   list[str] = []
+    csv_rows:         list[dict] = []
+    new_rule_designs_pci: list[str] = []
+    update_designs_pci:   list[str] = []
+    csv_rows_pci:         list[dict] = []
+    notes: list[str]            = []
+    design_count               = 0
+    new_rule_count             = 0
+    unknown_rule_count         = 0
+    nonstandard_rule_count     = 0
+    app_update_count           = 0
+    update_count               = 0
+    unused_count               = 0
+    named_service_count        = 0
+    inferred_count             = 0
+    pci_design_count           = 0
+    pci_new_rule_count         = 0
+    pci_update_count           = 0
 
     for row in rows:
         rule_name = row.get("rule", "").strip()
@@ -1038,6 +1088,7 @@ def main() -> None:
         ports_raw    = row.get("ports", "").strip()
         app_port_raw = row.get("app_port_details", "").strip()
         config       = configs[rule_name]
+        pci          = is_pci_rule(config, pci_tags)
 
         usable_apps, unknown_apps, has_risky = classify_apps(apps_raw, risky_apps)
         has_unknown = bool(unknown_apps)
@@ -1096,11 +1147,19 @@ def main() -> None:
             continue
 
         if complete == "skipped" or has_no_apps:
-            design_count += 1
-            unused_count += 1
-            update_designs.append(format_unused_design(design_count, rule_name, device_group, run_month_year))
-            if not args.no_csv:
-                csv_rows.append(build_tag_update_row(rule_name, TAG_UNUSED, device_group))
+            if pci:
+                pci_design_count += 1
+                _dnum = f"PCI-{pci_design_count}"
+                pci_update_count += 1
+                update_designs_pci.append(format_unused_design(_dnum, rule_name, device_group, run_month_year))
+                if not args.no_csv:
+                    csv_rows_pci.append(build_tag_update_row(rule_name, TAG_UNUSED, device_group))
+            else:
+                design_count += 1
+                unused_count += 1
+                update_designs.append(format_unused_design(design_count, rule_name, device_group, run_month_year))
+                if not args.no_csv:
+                    csv_rows.append(build_tag_update_row(rule_name, TAG_UNUSED, device_group))
             continue
 
         # ── Port filtering and service determination for main rule ────────────
@@ -1154,31 +1213,45 @@ def main() -> None:
         nonstandard_upd_num = None
 
         if generate_known:
-            design_count += 1
-            known_num = design_count
-            new_rule_count += 1
+            if pci:
+                pci_design_count += 1; known_num = f"PCI-{pci_design_count}"
+                pci_new_rule_count += 1
+            else:
+                design_count += 1; known_num = design_count
+                new_rule_count += 1
         elif known_exists and main_apps and args.update_existing:
-            design_count += 1
-            app_update_num = design_count
-            app_update_count += 1
+            if pci:
+                pci_design_count += 1; app_update_num = f"PCI-{pci_design_count}"
+            else:
+                design_count += 1; app_update_num = design_count
+                app_update_count += 1
 
         if generate_unknown:
-            design_count += 1
-            unknown_num = design_count
-            unknown_rule_count += 1
+            if pci:
+                pci_design_count += 1; unknown_num = f"PCI-{pci_design_count}"
+            else:
+                design_count += 1; unknown_num = design_count
+                unknown_rule_count += 1
 
         if generate_nonstandard:
-            design_count += 1
-            nonstandard_num = design_count
-            nonstandard_rule_count += 1
+            if pci:
+                pci_design_count += 1; nonstandard_num = f"PCI-{pci_design_count}"
+            else:
+                design_count += 1; nonstandard_num = design_count
+                nonstandard_rule_count += 1
         elif nonstandard_exists and nonst_apps and nonst_ports and args.update_existing:
-            design_count += 1
-            nonstandard_upd_num = design_count
-            app_update_count += 1
+            if pci:
+                pci_design_count += 1; nonstandard_upd_num = f"PCI-{pci_design_count}"
+            else:
+                design_count += 1; nonstandard_upd_num = design_count
+                app_update_count += 1
 
-        design_count += 1
-        update_num = design_count
-        update_count += 1
+        if pci:
+            pci_design_count += 1; update_num = f"PCI-{pci_design_count}"
+            pci_update_count += 1
+        else:
+            design_count += 1; update_num = design_count
+            update_count += 1
 
         # ── Notes ─────────────────────────────────────────────────────────────
         first_num = (known_num           if known_num           is not None else
@@ -1269,8 +1342,11 @@ def main() -> None:
             ))
 
         # ── Generate design blocks ────────────────────────────────────────────
+        _new_designs = new_rule_designs_pci if pci else new_rule_designs
+        _upd_designs = update_designs_pci   if pci else update_designs
+
         if generate_known:
-            new_rule_designs.append(format_new_rule_design(
+            _new_designs.append(format_new_rule_design(
                 design_number  = known_num,
                 rule_name      = rule_name,
                 config         = config,
@@ -1281,7 +1357,7 @@ def main() -> None:
                 run_month_year = run_month_year,
             ))
         elif app_update_num is not None:
-            update_designs.append(format_app_update_design(
+            _upd_designs.append(format_app_update_design(
                 design_number = app_update_num,
                 rule_name     = rule_name,
                 usable_apps   = main_apps,
@@ -1289,7 +1365,7 @@ def main() -> None:
             ))
 
         if generate_unknown:
-            new_rule_designs.append(format_unknown_rule_design(
+            _new_designs.append(format_unknown_rule_design(
                 design_number  = unknown_num,
                 rule_name      = rule_name,
                 config         = config,
@@ -1302,7 +1378,7 @@ def main() -> None:
 
         if generate_nonstandard:
             nonst_ports_sorted = sorted(nonst_ports)
-            new_rule_designs.append(format_nonstandard_rule_design(
+            _new_designs.append(format_nonstandard_rule_design(
                 design_number  = nonstandard_num,
                 rule_name      = rule_name,
                 config         = config,
@@ -1312,7 +1388,7 @@ def main() -> None:
                 run_month_year = run_month_year,
             ))
         elif nonstandard_upd_num is not None:
-            update_designs.append(format_app_update_design(
+            _upd_designs.append(format_app_update_design(
                 design_number = nonstandard_upd_num,
                 rule_name     = rule_name,
                 usable_apps   = nonst_apps,
@@ -1320,12 +1396,14 @@ def main() -> None:
                 rule_suffix   = "-NONSTANDARD",
             ))
 
-        update_designs.append(format_rule_update(update_num, rule_name, TAG_UNDER_REVIEW, device_group, run_month_year))
+        _upd_designs.append(format_rule_update(update_num, rule_name, TAG_UNDER_REVIEW, device_group, run_month_year))
 
         # ── CSV rows ──────────────────────────────────────────────────────────
         if not args.no_csv:
+            _csv = csv_rows_pci if pci else csv_rows
+
             if generate_known and main_apps:
-                csv_rows.append(build_new_rule_row(
+                _csv.append(build_new_rule_row(
                     rule_name      = rule_name,
                     config         = config,
                     usable_apps    = main_apps,
@@ -1335,7 +1413,7 @@ def main() -> None:
                     run_month_year = run_month_year,
                 ))
             elif app_update_num is not None:
-                csv_rows.append(build_app_update_row(rule_name, main_apps, device_group))
+                _csv.append(build_app_update_row(rule_name, main_apps, device_group))
 
             if generate_unknown:
                 unknown_csv_name = f"APP-ID-{rule_name}-UNKNOWN" if main_apps else f"APP-ID-{rule_name}"
@@ -1345,7 +1423,7 @@ def main() -> None:
                 unknown_service = (" | ".join(u_ports)
                                    if u_ports and u_ports != ["application-default"]
                                    else "application-default")
-                csv_rows.append({
+                _csv.append({
                     "type":             "new_rule",
                     "device_group":     device_group,
                     "rule_name":        unknown_csv_name,
@@ -1367,7 +1445,7 @@ def main() -> None:
             if generate_nonstandard:
                 nonst_tags = list(config.existing_tags) + [TAG_NEW_RULE, TAG_NONSTANDARD_RULE]
                 non_any_users = [u for u in config.source_users if u.lower() != "any"]
-                csv_rows.append({
+                _csv.append({
                     "type":             "new_rule",
                     "device_group":     device_group,
                     "rule_name":        f"APP-ID-{rule_name}-NONSTANDARD",
@@ -1386,13 +1464,14 @@ def main() -> None:
                     "tags_to_add":      "",
                 })
             elif nonstandard_upd_num is not None:
-                csv_rows.append(build_app_update_row(rule_name, nonst_apps, device_group, rule_suffix="-NONSTANDARD"))
+                _csv.append(build_app_update_row(rule_name, nonst_apps, device_group, rule_suffix="-NONSTANDARD"))
 
-            csv_rows.append(build_tag_update_row(rule_name, TAG_UNDER_REVIEW, device_group))
+            _csv.append(build_tag_update_row(rule_name, TAG_UNDER_REVIEW, device_group))
 
     SEP = "=" * 62
 
-    total_new = new_rule_count + unknown_rule_count + nonstandard_rule_count
+    total_new     = new_rule_count + unknown_rule_count + nonstandard_rule_count
+    total_designs = design_count + pci_design_count
     summary_lines = [
         "SUMMARY",
         SEP,
@@ -1402,7 +1481,7 @@ def main() -> None:
         (f"Input       : {args.input_csvs[0]}" if len(args.input_csvs) == 1
          else f"Input       : {len(args.input_csvs)} files merged ({', '.join(args.input_csvs)})"),
         "",
-        f"Designs     : {design_count} total"
+        f"Designs     : {total_designs} total"
         f" — {total_new} new rule(s)"
         f" ({nonstandard_rule_count} NONSTANDARD)"
         f", {app_update_count} app update(s)"
@@ -1411,6 +1490,13 @@ def main() -> None:
         f"Duplicates  : {existing_app_ids} existing APP-ID rule(s) detected"
         + (" — skipped" if existing_app_ids and not args.update_existing else (" — app_update generated" if existing_app_ids and args.update_existing else " — none")),
     ]
+    if pci_tags:
+        summary_lines.append(
+            f"PCI         : {pci_design_count} design(s)"
+            f" — {pci_new_rule_count} new rule(s)"
+            f", {pci_update_count} tag update(s)"
+            + (f"  →  {pci_csv_path}" if not args.no_csv else "")
+        )
     if named_service_count or inferred_count:
         summary_lines.append(
             f"Inference   : {inferred_count} rule(s) with inferred apps"
@@ -1430,6 +1516,10 @@ def main() -> None:
         sections.append(f"NEW RULES\n{SEP}\n\n" + "\n\n---\n\n".join(new_rule_designs))
     if update_designs:
         sections.append(f"RULE UPDATES\n{SEP}\n\n" + "\n\n---\n\n".join(update_designs))
+    if new_rule_designs_pci:
+        sections.append(f"PCI — NEW RULES\n{SEP}\n\n" + "\n\n---\n\n".join(new_rule_designs_pci))
+    if update_designs_pci:
+        sections.append(f"PCI — RULE UPDATES\n{SEP}\n\n" + "\n\n---\n\n".join(update_designs_pci))
     text_output = "\n\n\n".join(preamble + sections)
 
     with open(txt_path, "w", encoding="utf-8") as fh:
@@ -1441,18 +1531,30 @@ def main() -> None:
             writer.writeheader()
             writer.writerows(csv_rows)
 
+    if not args.no_csv and csv_rows_pci:
+        with open(pci_csv_path, "w", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=DESIGN_CSV_FIELDNAMES)
+            writer.writeheader()
+            writer.writerows(csv_rows_pci)
+
     print("=" * 62)
-    print(f"  {design_count} design(s) total")
+    print(f"  {total_designs} design(s) total")
     print(f"  {total_new} new rule(s) ({nonstandard_rule_count} NONSTANDARD)"
           f"  |  {app_update_count} app update(s)"
           f"  |  {update_count} tag update(s)"
           f"  |  {unused_count} unused (no traffic)")
+    if pci_tags:
+        print(f"  PCI: {pci_design_count} design(s)"
+              f"  |  {pci_new_rule_count} new rule(s)"
+              f"  |  {pci_update_count} tag update(s)")
     if named_service_count or inferred_count:
         print(f"  {inferred_count} rule(s) with inferred apps"
               f"  |  {named_service_count} rule(s) with named service objects")
     print(f"  Text : {txt_path}")
     if not args.no_csv:
         print(f"  CSV  : {csv_path}")
+        if pci_tags and csv_rows_pci:
+            print(f"  CSV (PCI) : {pci_csv_path}")
     print("=" * 62)
 
 
