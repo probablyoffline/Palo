@@ -66,7 +66,7 @@ import ops_lib        # noqa: E402
 import log_query_lib  # noqa: E402
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-VERSION              = "1.5.3"
+VERSION              = "1.5.4"
 
 DAYS_BACK            = 7
 MAX_LOGS             = 5000
@@ -307,6 +307,10 @@ def _process_rule(
     """
     lines: list[str] = [f"[{rule_index}/{total_rules}] {rule_name}"]
     services = services_map.get(rule_name, [])
+
+    if PARALLEL:
+        with _print_lock:
+            print(f"[{rule_index}/{total_rules}] {rule_name}  → running...", flush=True)
 
     # ── Decide data source ────────────────────────────────────────────────────
     use_stats  = False
