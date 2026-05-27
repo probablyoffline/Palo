@@ -94,7 +94,7 @@ requests.packages.urllib3.disable_warnings()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-__version__ = "1.10.0"
+__version__ = "1.10.1"
 
 APP_REVIEW_THRESHOLD     = 10  # flag designs with this many or more usable apps
 PORT_INFERENCE_THRESHOLD = 3   # infer app from port only when ≤ this many apps claim it
@@ -1175,7 +1175,7 @@ def main() -> None:
                 combined_std |= full_app_port_map.get(app, set())
             if observed_ports:
                 filtered = [p for p in valid_configured
-                            if p == "application-default" or p in observed_ports]
+                            if p == "application-default" or (p in observed_ports and p not in nonst_ports)]
             else:
                 filtered = [p for p in valid_configured
                             if p == "application-default" or p in combined_std]
