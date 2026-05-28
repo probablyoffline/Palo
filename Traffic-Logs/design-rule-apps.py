@@ -14,7 +14,7 @@ Port standard determination (default — dynamic mode):
     - If all current ports are standard for the observed apps → new rule uses
       application-default, no app-id-non-standard tag.
     - If any port is not standard for any of the observed apps → new rule lists
-      all ports explicitly, separate APP-ID-<name>-NONSTANDARD rule generated.
+      all ports explicitly, separate APP-ID-<name>-NS rule generated.
   This reflects Palo Alto's own definition of what is standard — not a static list.
 
   Use --static-ports to disable dynamic lookup and fall back to standard-ports.txt.
@@ -58,7 +58,7 @@ Options:
 Output .txt sections (in order):
     SUMMARY          — counters, file paths, PCI breakdown (if applicable)
     NOTES            — per-design warnings (inferred apps, dropped ports, etc.)
-    NEW RULES        — APP-ID-*, APP-ID-*-UNKNOWN, APP-ID-*-NONSTANDARD creations
+    NEW RULES        — APP-ID-*, APP-ID-*-UNKNOWN, APP-ID-*-NS creations
     RULE UPDATES     — tag additions to existing rules (app-id-under-review, etc.)
     PCI — NEW RULES  — same as NEW RULES, PCI-scoped rules only (if applicable)
     PCI — RULE UPDATES — same as RULE UPDATES, PCI-scoped rules only (if applicable)
@@ -69,7 +69,7 @@ Design logic:
   - unknown-tcp / unknown-udp → excluded from app list, separate UNKNOWN rule
   - incomplete / not-applicable → excluded silently
   - Risky apps → risky-app tag added
-  - Non-standard port traffic → separate APP-ID-<name>-NONSTANDARD rule
+  - Non-standard port traffic → separate APP-ID-<name>-NS rule
   - Apps inferred from observed/configured ports (≤3 apps claim that port)
   - All new rules get: app-id-new-rule
   - Old rules with new rules get: app-id-under-review
@@ -94,7 +94,7 @@ requests.packages.urllib3.disable_warnings()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-__version__ = "1.10.1"
+__version__ = "1.10.2"
 
 APP_REVIEW_THRESHOLD     = 10  # flag designs with this many or more usable apps
 PORT_INFERENCE_THRESHOLD = 3   # infer app from port only when ≤ this many apps claim it
@@ -742,7 +742,7 @@ def format_nonstandard_rule_design(
     lines += [
         f"In {device_group}",
         f"Clone Rule ABOVE: {rule_name}",
-        f"New Rule Name: APP-ID-{rule_name}-NONSTANDARD",
+        f"New Rule Name: APP-ID-{rule_name}-NS",
         f"Description: DDD created {run_month_year}",
         f"Tags: {_csv_list(tags)}",
         "",
@@ -1002,7 +1002,7 @@ def main() -> None:
     app_id_names = (
         [f"APP-ID-{n}" for n in rule_names]
         + [f"APP-ID-{n}-UNKNOWN" for n in rule_names]
-        + [f"APP-ID-{n}-NONSTANDARD" for n in rule_names]
+        + [f"APP-ID-{n}-NS" for n in rule_names]
     )
 
     print(f"  Fetching rule configs for {len(rule_names)} rules ...", end=" ", flush=True)
@@ -1199,7 +1199,7 @@ def main() -> None:
         # ── Check for existing APP-ID rules ───────────────────────────────────
         known_exists       = configs[f"APP-ID-{rule_name}"].found
         unknown_exists     = configs[f"APP-ID-{rule_name}-UNKNOWN"].found
-        nonstandard_exists = configs[f"APP-ID-{rule_name}-NONSTANDARD"].found
+        nonstandard_exists = configs[f"APP-ID-{rule_name}-NS"].found
 
         generate_known       = bool(main_apps)    and not known_exists
         generate_unknown     = bool(unknown_apps) and not unknown_exists
@@ -1305,12 +1305,12 @@ def main() -> None:
             if args.update_existing:
                 notes.append((
                     f"Design {nonstandard_upd_num} — {rule_name}",
-                    f"APP-ID-{rule_name}-NONSTANDARD already exists — app_update design generated.",
+                    f"APP-ID-{rule_name}-NS already exists — app_update design generated.",
                 ))
             else:
                 notes.append((
                     f"Design {update_num} — {rule_name}",
-                    f"APP-ID-{rule_name}-NONSTANDARD already exists — skipped. Use --update-existing to add new apps.",
+                    f"APP-ID-{rule_name}-NS already exists — skipped. Use --update-existing to add new apps.",
                 ))
         if generate_nonstandard:
             notes.append((
@@ -1393,7 +1393,7 @@ def main() -> None:
                 rule_name     = rule_name,
                 usable_apps   = nonst_apps,
                 device_group  = device_group,
-                rule_suffix   = "-NONSTANDARD",
+                rule_suffix   = "-NS",
             ))
 
         _upd_designs.append(format_rule_update(update_num, rule_name, TAG_UNDER_REVIEW, device_group, run_month_year))
@@ -1448,7 +1448,7 @@ def main() -> None:
                 _csv.append({
                     "type":             "new_rule",
                     "device_group":     device_group,
-                    "rule_name":        f"APP-ID-{rule_name}-NONSTANDARD",
+                    "rule_name":        f"APP-ID-{rule_name}-NS",
                     "clone_above":      rule_name,
                     "description":      f"DDD created {run_month_year}",
                     "tags":             "|".join(nonst_tags),
@@ -1464,7 +1464,7 @@ def main() -> None:
                     "tags_to_add":      "",
                 })
             elif nonstandard_upd_num is not None:
-                _csv.append(build_app_update_row(rule_name, nonst_apps, device_group, rule_suffix="-NONSTANDARD"))
+                _csv.append(build_app_update_row(rule_name, nonst_apps, device_group, rule_suffix="-NS"))
 
             _csv.append(build_tag_update_row(rule_name, TAG_UNDER_REVIEW, device_group))
 
