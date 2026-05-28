@@ -50,12 +50,20 @@ tftp:udp-69
 # ── Directory / auth ──────────────────────────────────────────────────────────
 ldap:tcp-389
 ldap:udp-389
+ldap:tcp-3268
+ldap:udp-3268
 ldaps:tcp-636
+ldaps:tcp-3269
+# Without SSL decryption, LDAPS/GC-SSL traffic is identified as ssl on these ports
+ssl:tcp-636
+ssl:tcp-3269
 kerberos:tcp-88
 kerberos:udp-88
-# tcp-445/udp-445: add other SMB-related app names if they appear in your traffic
+# SMB apps — add other variants if they appear in your traffic
 ms-ds-smbv3:tcp-445
 ms-ds-smbv3:udp-445
+ms-ds-smb-base:tcp-445
+ms-ds-smb-base:udp-445
 
 # ── Other common protocols ────────────────────────────────────────────────────
 telnet:tcp-23

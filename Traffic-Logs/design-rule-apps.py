@@ -18,8 +18,10 @@ Port standard determination (default — dynamic mode):
   This reflects Palo Alto's own definition of what is standard — not a static list.
 
   Use --static-ports to disable dynamic lookup and fall back to standard-ports.txt.
-  Dynamic lookup also falls back to standard-ports.txt automatically if the API
-  call fails.
+  In dynamic mode, standard-ports.txt is also loaded as a supplemental floor — its
+  entries prevent false non-standard flags for ports that Panorama's predefined XML
+  defines incompletely (e.g. bare port numbers without protocol).  If the API call
+  fails entirely, standard-ports.txt becomes the primary reference.
 
 PCI rule splitting:
   When flags-pci.txt is present, any rule whose existing Panorama tags include one
