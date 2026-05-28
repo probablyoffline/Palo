@@ -94,10 +94,11 @@ requests.packages.urllib3.disable_warnings()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-__version__ = "1.10.3"
+__version__ = "1.10.4"
 
 APP_REVIEW_THRESHOLD     = 10  # flag designs with this many or more usable apps
 PORT_INFERENCE_THRESHOLD = 3   # infer app from port only when ≤ this many apps claim it
+APP_FETCH_BATCH          = 50  # max apps per XPath filter to avoid PAN-OS XPath length limits
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
@@ -299,43 +300,46 @@ def fetch_app_default_ports(app_names: list[str]) -> tuple[dict[str, set[str]], 
     port_map: dict[str, set[str]] = {name: set() for name in wanted}
     api_available = False
 
-    # Build a single XPath filter for all needed apps (one API call per source)
-    if len(wanted) == 1:
-        app_filter = f"@name='{next(iter(wanted))}'"
-    else:
-        app_filter = " or ".join(f"@name='{a}'" for a in sorted(wanted))
+    # Process in batches to avoid PAN-OS XPath length limits on large app sets.
+    # Last writer wins across batches (custom apps can override predefined).
+    sorted_wanted = sorted(wanted)
+    for i in range(0, len(sorted_wanted), APP_FETCH_BATCH):
+        batch = sorted_wanted[i : i + APP_FETCH_BATCH]
+        if len(batch) == 1:
+            app_filter = f"@name='{batch[0]}'"
+        else:
+            app_filter = " or ".join(f"@name='{a}'" for a in batch)
 
-    # Sources to query in order; last writer wins (custom apps can override predefined)
-    sources: list[str] = [f"/config/predefined/application/entry[{app_filter}]"]
-    if ops_lib.MODE == "panorama":
-        sources.append(f"/config/shared/application/entry[{app_filter}]")
-        sources.append(
-            f"/config/devices/entry[@name='localhost.localdomain']"
-            f"/device-group/entry[@name='{ops_lib.DEVICE_GROUP}']"
-            f"/application/entry[{app_filter}]"
-        )
-    else:
-        sources.append(
-            f"/config/devices/entry[@name='localhost.localdomain']"
-            f"/vsys/entry[@name='{ops_lib.VSYS}']/application/entry[{app_filter}]"
-        )
+        sources: list[str] = [f"/config/predefined/application/entry[{app_filter}]"]
+        if ops_lib.MODE == "panorama":
+            sources.append(f"/config/shared/application/entry[{app_filter}]")
+            sources.append(
+                f"/config/devices/entry[@name='localhost.localdomain']"
+                f"/device-group/entry[@name='{ops_lib.DEVICE_GROUP}']"
+                f"/application/entry[{app_filter}]"
+            )
+        else:
+            sources.append(
+                f"/config/devices/entry[@name='localhost.localdomain']"
+                f"/vsys/entry[@name='{ops_lib.VSYS}']/application/entry[{app_filter}]"
+            )
 
-    for xpath in sources:
-        try:
-            xml_text = ops_lib.api_get(xpath)
-            root = ET.fromstring(xml_text)
-        except Exception:
-            continue
+        for xpath in sources:
+            try:
+                xml_text = ops_lib.api_get(xpath)
+                root = ET.fromstring(xml_text)
+            except Exception:
+                continue
 
-        if root.get("status") == "error":
-            continue
+            if root.get("status") == "error":
+                continue
 
-        api_available = True
-        for entry in root.iter("entry"):
-            name = entry.get("name", "")
-            if name in wanted:
-                ports = _parse_app_ports_to_set(entry)
-                port_map[name] |= ports
+            api_available = True
+            for entry in root.iter("entry"):
+                name = entry.get("name", "")
+                if name in wanted:
+                    ports = _parse_app_ports_to_set(entry)
+                    port_map[name] |= ports
 
     return port_map, api_available
 
@@ -1118,11 +1122,16 @@ def main() -> None:
         nonst_observed_apps: list[str] = []
         nonst_ports:         set[str]  = set()
 
+        unknown_std_apps: list[str] = []  # observed apps with no standard port data
         if dynamic_available and app_port_obs:
             for app in usable_apps:
                 app_std     = app_port_map.get(app, set()) | full_app_port_map.get(app, set())
                 obs_for_app = app_port_obs.get(app, set())
-                app_nonst   = obs_for_app - app_std
+                if not app_std and obs_for_app:
+                    unknown_std_apps.append(app)
+                # Only flag non-standard when we have a reference set to compare against;
+                # apps with no defined standard ports cannot have non-standard violations.
+                app_nonst   = (obs_for_app - app_std) if app_std else set()
                 if app_nonst:
                     nonst_ports |= app_nonst
                     nonst_observed_apps.append(app)
@@ -1275,6 +1284,13 @@ def main() -> None:
             notes.append((
                 f"Design {first_num} — {rule_name}",
                 f"apps inferred from {src}: {', '.join(inferred_apps)} — verify before implementing.",
+            ))
+        if unknown_std_apps:
+            notes.append((
+                f"Design {first_num} — {rule_name}",
+                f"standard ports not found in Panorama app-id database for: "
+                f"{', '.join(unknown_std_apps)} — observed ports treated as standard. "
+                f"Verify manually or check Panorama connectivity.",
             ))
         dropped: list[str] = []
         if not has_named_service and dynamic_available and valid_configured:
