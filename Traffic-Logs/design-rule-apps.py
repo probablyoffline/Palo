@@ -94,7 +94,7 @@ requests.packages.urllib3.disable_warnings()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-__version__ = "1.10.2"
+__version__ = "1.10.3"
 
 APP_REVIEW_THRESHOLD     = 10  # flag designs with this many or more usable apps
 PORT_INFERENCE_THRESHOLD = 3   # infer app from port only when ≤ this many apps claim it
@@ -112,7 +112,6 @@ UNKNOWN_APP_VALUES = frozenset({"unknown-tcp", "unknown-udp"})
 
 TAG_NEW_RULE        = "app-id-new-rule"
 TAG_NON_STANDARD    = "app-id-non-standard"
-TAG_NONSTANDARD_RULE = "app-id-nonstandard-port"
 TAG_UNKNOWN         = "app-id-unknown"
 TAG_RISKY           = "risky-app"
 TAG_UNDER_REVIEW    = "app-id-under-review"
@@ -735,7 +734,7 @@ def format_nonstandard_rule_design(
     device_group:   str,
     run_month_year: str,
 ) -> str:
-    tags = list(config.existing_tags) + [TAG_NEW_RULE, TAG_NONSTANDARD_RULE]
+    tags = list(config.existing_tags) + [TAG_NEW_RULE, TAG_NON_STANDARD]
     service = ", ".join(nonst_ports)
 
     lines = [f"Design {design_number}", ""]
@@ -1443,7 +1442,7 @@ def main() -> None:
                 })
 
             if generate_nonstandard:
-                nonst_tags = list(config.existing_tags) + [TAG_NEW_RULE, TAG_NONSTANDARD_RULE]
+                nonst_tags = list(config.existing_tags) + [TAG_NEW_RULE, TAG_NON_STANDARD]
                 non_any_users = [u for u in config.source_users if u.lower() != "any"]
                 _csv.append({
                     "type":             "new_rule",
