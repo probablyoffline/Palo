@@ -31,7 +31,13 @@ PCI rule splitting:
 
 Config files (auto-read from the same directory as this script):
   risky-apps.txt      — one app name per line.  Matching apps add the risky-app tag.
-  standard-ports.txt  — fallback used when --static-ports is set or API is unavailable.
+  standard-ports.txt  — standard port definitions used in two ways:
+                         • In dynamic mode: loaded as a supplement for apps whose standard
+                           ports are absent or incomplete in Panorama's predefined database.
+                         • In static mode (--static-ports): primary reference for all rules.
+                         Supports two line formats:
+                           tcp-80          global: standard for any app observed on this port
+                           msrpc:tcp-135   per-app: standard only for that specific app
   flags-pci.txt       — one Panorama tag name per line.  Rules tagged with any of
                         these are separated into the PCI output stream.
 
@@ -94,7 +100,7 @@ requests.packages.urllib3.disable_warnings()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-__version__ = "1.10.4"
+__version__ = "1.10.6"
 
 APP_REVIEW_THRESHOLD     = 10  # flag designs with this many or more usable apps
 PORT_INFERENCE_THRESHOLD = 3   # infer app from port only when ≤ this many apps claim it
@@ -172,6 +178,45 @@ def load_set_from_file(
     return result
 
 
+def load_standard_ports_file(
+    path: Path,
+    require: bool,
+    label: str,
+) -> tuple[set[str], dict[str, set[str]]]:
+    """
+    Load standard-ports.txt supporting two line formats:
+      tcp-80            — global: treated as standard for any app observed on this port
+      msrpc:tcp-135     — per-app: treated as standard only when this specific app is
+                          observed on this port
+    Returns (global_ports, per_app_ports).
+    If the file is missing and require=True, a warning is printed; otherwise silent.
+    """
+    if not path.exists():
+        if require:
+            print(f"  Warning: {label} not found ({path.name}) — treating all explicit ports as non-standard")
+        return set(), {}
+    global_ports: set[str] = set()
+    per_app: dict[str, set[str]] = {}
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            s = line.strip().lower()
+            if not s or s.startswith("#"):
+                continue
+            if ":" in s:
+                app_name, port_spec = s.split(":", 1)
+                app_name = app_name.strip()
+                port_spec = port_spec.strip()
+                if app_name and port_spec:
+                    per_app.setdefault(app_name, set()).add(port_spec)
+            else:
+                global_ports.add(s)
+    n_global  = len(global_ports)
+    n_per_app = sum(len(v) for v in per_app.values())
+    print(f"  Loaded {n_global + n_per_app} entries from {path.name}"
+          f" ({n_global} global, {n_per_app} per-app)")
+    return global_ports, per_app
+
+
 # ── PCI detection ────────────────────────────────────────────────────────────
 
 def is_pci_rule(config: RuleConfig, pci_tags: set[str]) -> bool:
@@ -245,8 +290,10 @@ def fetch_full_rule_configs(rule_names: list[str]) -> dict[str, RuleConfig]:
 def _parse_app_ports_to_set(entry: ET.Element) -> set[str]:
     """
     Extract default ports from a PAN-OS app entry element.
-    Converts 'tcp/80' → 'tcp-80'.  Expands ranges up to MAX_RANGE_EXPAND ports;
-    wider ranges are skipped (conservative — ports in that range stay non-standard).
+    Handles two member formats:
+      'tcp/80'  → tcp-80  (proto/port, existing format)
+      '80'      → tcp-80 and udp-80  (bare number; assumes both protocols)
+    Expands ranges up to MAX_RANGE_EXPAND ports; wider ranges are skipped.
     """
     result: set[str] = set()
     default_el = entry.find("default")
@@ -257,23 +304,39 @@ def _parse_app_ports_to_set(entry: ET.Element) -> set[str]:
         return result
 
     for member in port_el.findall("member"):
-        if not member.text or "/" not in member.text:
+        if not member.text:
             continue
-        proto, port_spec = member.text.strip().lower().split("/", 1)
-        if "-" in port_spec:
+        text = member.text.strip().lower()
+        if "/" in text:
+            proto, port_spec = text.split("/", 1)
+            if "-" in port_spec:
+                try:
+                    start_n, end_n = (int(x) for x in port_spec.split("-", 1))
+                    if end_n - start_n <= MAX_RANGE_EXPAND:
+                        for p in range(start_n, end_n + 1):
+                            result.add(f"{proto}-{p}")
+                except ValueError:
+                    pass
+            else:
+                try:
+                    int(port_spec)
+                    result.add(f"{proto}-{port_spec}")
+                except ValueError:
+                    pass
+        elif "-" in text:
+            # Bare range without protocol — add both tcp and udp
             try:
-                start_n, end_n = (int(x) for x in port_spec.split("-", 1))
+                start_n, end_n = (int(x) for x in text.split("-", 1))
                 if end_n - start_n <= MAX_RANGE_EXPAND:
                     for p in range(start_n, end_n + 1):
-                        result.add(f"{proto}-{p}")
+                        result.add(f"tcp-{p}")
+                        result.add(f"udp-{p}")
             except ValueError:
                 pass
-        else:
-            try:
-                int(port_spec)
-                result.add(f"{proto}-{port_spec}")
-            except ValueError:
-                pass
+        elif text.isdigit():
+            # Bare port number without protocol — add both tcp and udp
+            result.add(f"tcp-{text}")
+            result.add(f"udp-{text}")
 
     return result
 
@@ -971,9 +1034,11 @@ def main() -> None:
         print(f"  PCI csv     : {pci_csv_path}")
 
     sp_path = Path(args.standard_ports_file) if args.standard_ports_file else STANDARD_PORTS_FILE
-    static_standard_ports: set[str] = set()
-    if args.static_ports:
-        static_standard_ports = load_set_from_file(sp_path, default=None, label="standard-ports")
+    static_standard_ports, per_app_standard_ports = load_standard_ports_file(
+        sp_path,
+        require=args.static_ports,   # warn if missing only when it's the primary reference
+        label="standard-ports" if args.static_ports else "standard-ports (supplement)",
+    )
 
     print()
 
@@ -1040,8 +1105,8 @@ def main() -> None:
                 print(f"{n_with_ports}/{len(all_usable)} apps have defined standard ports")
             else:
                 print("API unavailable — falling back to standard-ports.txt")
-                static_standard_ports = load_set_from_file(
-                    sp_path, default=None, label="standard-ports"
+                static_standard_ports, per_app_standard_ports = load_standard_ports_file(
+                    sp_path, require=True, label="standard-ports"
                 )
 
     # ── Full app-port map for inference (all predefined apps, unfiltered) ─────
@@ -1129,9 +1194,12 @@ def main() -> None:
                 obs_for_app = app_port_obs.get(app, set())
                 if not app_std and obs_for_app:
                     unknown_std_apps.append(app)
-                # Only flag non-standard when we have a reference set to compare against;
-                # apps with no defined standard ports cannot have non-standard violations.
-                app_nonst   = (obs_for_app - app_std) if app_std else set()
+                # Supplement with observed ports that appear in the standard-ports floor.
+                # Global entries apply to any app; per-app entries apply only to this app.
+                supplement  = static_standard_ports | per_app_standard_ports.get(app, set())
+                app_std_eff = app_std | (obs_for_app & supplement)
+                # Only flag non-standard when we have a reference set to compare against.
+                app_nonst   = (obs_for_app - app_std_eff) if app_std_eff else set()
                 if app_nonst:
                     nonst_ports |= app_nonst
                     nonst_observed_apps.append(app)
@@ -1181,6 +1249,8 @@ def main() -> None:
             for app in main_apps:
                 combined_std |= app_port_map.get(app, set())
                 combined_std |= full_app_port_map.get(app, set())
+                combined_std |= per_app_standard_ports.get(app, set())
+            combined_std |= static_standard_ports
             if observed_ports:
                 filtered = [p for p in valid_configured
                             if p == "application-default" or (p in observed_ports and p not in nonst_ports)]
