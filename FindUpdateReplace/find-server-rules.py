@@ -15,7 +15,7 @@ Usage:
   python find-server-rules.py servers.txt
   python find-server-rules.py servers.csv --workers 12
 
-Configuration: set TARGET_HOST and API_KEY in ../ops_lib.py
+Configuration: set TARGET_HOST and API_KEY in ../libs/ops_lib.py
 """
 
 __version__ = "1.0.0"
@@ -37,7 +37,7 @@ from typing import Optional
 import requests
 
 # ── Import connection config from ops_lib ─────────────────────────────────────
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "libs"))
 import ops_lib
 
 TARGET_HOST = ops_lib.TARGET_HOST
