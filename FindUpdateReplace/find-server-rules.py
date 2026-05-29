@@ -14,17 +14,22 @@ Outputs (in Output/ subdirectory):
 Usage:
   python find-server-rules.py servers.txt
   python find-server-rules.py servers.csv --workers 12
+  python find-server-rules.py servers.txt --resume              # skip API, reuse last fetch
+  python find-server-rules.py servers.txt --resume data.json
+  python find-server-rules.py servers.txt --debug              # log raw API responses
 
 Configuration: set TARGET_HOST and API_KEY in ../libs/ops_lib.py
 """
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 import argparse
 import concurrent.futures
 import csv
+import dataclasses
 import datetime
 import ipaddress
+import json
 import logging
 import os
 import socket
@@ -47,9 +52,10 @@ requests.packages.urllib3.disable_warnings()
 
 log = logging.getLogger(__name__)
 
-SCRIPT_NAME = "find-server-rules"
-_DEV        = "entry[@name='localhost.localdomain']"
-_BASE       = f"/config/devices/{_DEV}"
+SCRIPT_NAME  = "find-server-rules"
+DEFAULT_CACHE = "Output/find-server-rules-cache.json"
+_DEV         = "entry[@name='localhost.localdomain']"
+_BASE        = f"/config/devices/{_DEV}"
 
 
 # ── Data structures ───────────────────────────────────────────────────────────
@@ -102,7 +108,7 @@ def api_get(xpath: str) -> Optional[ET.Element]:
         r.raise_for_status()
         root = ET.fromstring(r.text)
         if root.get("status") != "success":
-            log.debug("API non-success for %s: %s", xpath, r.text[:200])
+            log.debug("api_get non-success for %s: %s", xpath, r.text[:400])
             return None
         return root.find("result")
     except Exception as exc:
@@ -122,9 +128,11 @@ def api_op(cmd: str) -> Optional[ET.Element]:
         r.raise_for_status()
         root = ET.fromstring(r.text)
         if root.get("status") != "success":
+            log.debug("api_op non-success: %s", r.text[:400])
             return None
         return root.find("result")
-    except Exception:
+    except Exception as exc:
+        log.debug("api_op exception: %s", exc)
         return None
 
 
@@ -221,7 +229,6 @@ def fetch_dg_names() -> list:
         return []
     dg_node = result.find("device-group")
     if dg_node is None:
-        # Result may already be the device-group element or contain entries directly
         dg_node = result
     return [e.get("name", "") for e in dg_node.findall("entry") if e.get("name")]
 
@@ -234,7 +241,9 @@ def fetch_address_objects(dg: str) -> list:
     result = api_get(xpath)
     if result is None:
         return []
-    container = result.find("address") or result
+    container = result.find("address")
+    if container is None:
+        container = result
     objects = []
     for entry in container.findall("entry"):
         name = entry.get("name", "")
@@ -256,7 +265,9 @@ def fetch_address_groups(dg: str) -> list:
     result = api_get(xpath)
     if result is None:
         return []
-    container = result.find("address-group") or result
+    container = result.find("address-group")
+    if container is None:
+        container = result
     groups = []
     for entry in container.findall("entry"):
         name = entry.get("name", "")
@@ -264,6 +275,22 @@ def fetch_address_groups(dg: str) -> list:
         mems = [m.text for m in (static.findall("member") if static is not None else []) if m.text]
         groups.append(AddrGroup(name=name, members=mems, dg=dg))
     return groups
+
+
+def _embedded_usage(entry: ET.Element) -> Optional[str]:
+    """
+    Check for rule usage data embedded in the rule XML itself.
+    Some PAN-OS versions include <rule-usage> or <last-hit-timestamp> in
+    the running config. Returns "used", "unused", or None.
+    """
+    ru = entry.find("rule-usage")
+    if ru is not None and ru.text:
+        val = ru.text.strip().lower()
+        return "unused" if val in ("unused", "0", "no", "false") else "used"
+    lh = entry.find("last-hit-timestamp")
+    if lh is not None and lh.text and lh.text.strip() not in ("", "0"):
+        return "used"
+    return None
 
 
 def _parse_security_rules(dg: str, rulebase: str, result: ET.Element) -> list:
@@ -277,18 +304,19 @@ def _parse_security_rules(dg: str, rulebase: str, result: ET.Element) -> list:
         disabled_node = entry.find("disabled")
         action_node   = entry.find("action")
         rules.append({
-            "name":        entry.get("name", ""),
-            "dg":          dg,
-            "rulebase":    rulebase,
-            "rule_type":   "security",
-            "source":      _members(entry, "source"),
-            "destination": _members(entry, "destination"),
-            "from":        _members(entry, "from"),
-            "to":          _members(entry, "to"),
-            "application": _members(entry, "application"),
-            "service":     _members(entry, "service"),
-            "action":      (action_node.text if action_node is not None else "") or "",
-            "disabled":    (disabled_node.text if disabled_node is not None else "no") or "no",
+            "name":                entry.get("name", ""),
+            "dg":                  dg,
+            "rulebase":            rulebase,
+            "rule_type":           "security",
+            "source":              _members(entry, "source"),
+            "destination":         _members(entry, "destination"),
+            "from":                _members(entry, "from"),
+            "to":                  _members(entry, "to"),
+            "application":         _members(entry, "application"),
+            "service":             _members(entry, "service"),
+            "action":              (action_node.text if action_node is not None else "") or "",
+            "disabled":            (disabled_node.text if disabled_node is not None else "no") or "no",
+            "rule_usage_embedded": _embedded_usage(entry),
         })
     return rules
 
@@ -330,18 +358,19 @@ def _parse_nat_rules(dg: str, rulebase: str, result: ET.Element) -> list:
 
         disabled_node = entry.find("disabled")
         rules.append({
-            "name":               entry.get("name", ""),
-            "dg":                 dg,
-            "rulebase":           rulebase,
-            "rule_type":          "nat",
-            "source":             _members(entry, "source"),
-            "destination":        _members(entry, "destination"),
-            "from":               _members(entry, "from"),
-            "to":                 _members(entry, "to"),
-            "translated_source":  trans_src,
-            "translated_dest":    trans_dst,
-            "action":             nat_type or "nat",
-            "disabled":           (disabled_node.text if disabled_node is not None else "no") or "no",
+            "name":                entry.get("name", ""),
+            "dg":                  dg,
+            "rulebase":            rulebase,
+            "rule_type":           "nat",
+            "source":              _members(entry, "source"),
+            "destination":         _members(entry, "destination"),
+            "from":                _members(entry, "from"),
+            "to":                  _members(entry, "to"),
+            "translated_source":   trans_src,
+            "translated_dest":     trans_dst,
+            "action":              nat_type or "nat",
+            "disabled":            (disabled_node.text if disabled_node is not None else "no") or "no",
+            "rule_usage_embedded": _embedded_usage(entry),
         })
     return rules
 
@@ -361,16 +390,8 @@ def fetch_one_rule_set(dg: str, rulebase: str, rule_type: str) -> list:
 
 # ── Rule usage ────────────────────────────────────────────────────────────────
 
-def fetch_rule_usage(dg: str) -> dict:
-    """Return {rule_name: "used"|"unused"} for a DG. Empty dict if unavailable."""
-    cmd = (
-        f"<show><rule-use><rule-base>security</rule-base>"
-        f"<device-group><entry name='{dg}'/></device-group>"
-        f"</rule-use></show>"
-    )
-    result = api_op(cmd)
-    if result is None:
-        return {}
+def _parse_usage_result(result: ET.Element) -> dict:
+    """Parse a show rule-use result element into {rule_name: "used"|"unused"}."""
     usage = {}
     for entry in result.iter("entry"):
         name = entry.get("name", "")
@@ -378,10 +399,85 @@ def fetch_rule_usage(dg: str) -> dict:
             continue
         for child in entry:
             if child.tag in ("used", "rule-use"):
-                val = (child.text or "").lower()
+                val = (child.text or "").strip().lower()
                 usage[name] = "used" if val in ("yes", "1", "true") else "unused"
                 break
     return usage
+
+
+def fetch_rule_usage(dg: str) -> dict:
+    """Return {rule_name: "used"|"unused"} for a DG. Empty dict if unavailable."""
+    # Try flat device-group format first (most common on Panorama)
+    cmd_flat = (
+        f"<show><rule-use><rule-base>security</rule-base>"
+        f"<device-group>{dg}</device-group>"
+        f"</rule-use></show>"
+    )
+    result = api_op(cmd_flat)
+    if result is not None:
+        parsed = _parse_usage_result(result)
+        if parsed:
+            return parsed
+
+    # Fall back: <entry> wrapper format
+    cmd_entry = (
+        f"<show><rule-use><rule-base>security</rule-base>"
+        f"<device-group><entry name='{dg}'/></device-group>"
+        f"</rule-use></show>"
+    )
+    log.debug("fetch_rule_usage: flat format returned nothing for %s, trying entry format", dg)
+    result = api_op(cmd_entry)
+    if result is not None:
+        parsed = _parse_usage_result(result)
+        if parsed:
+            return parsed
+
+    return {}
+
+
+# ── Cache: save / load ────────────────────────────────────────────────────────
+
+def save_cache(
+    path: str,
+    dg_names: list,
+    all_objects: list,
+    all_groups: list,
+    all_rules: list,
+    usage_map: dict,
+) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    payload = {
+        "fetched_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "panorama":   TARGET_HOST,
+        "dg_names":   dg_names,
+        "objects":    [dataclasses.asdict(o) for o in all_objects],
+        "groups":     [dataclasses.asdict(g) for g in all_groups],
+        "rules":      all_rules,
+        "usage_map":  usage_map,
+    }
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2)
+    log.info("Cache saved: %s", path)
+
+
+def load_cache(path: str) -> tuple:
+    """Return (dg_names, all_objects, all_groups, all_rules, usage_map)."""
+    with open(path, encoding="utf-8") as fh:
+        payload = json.load(fh)
+
+    fetched_at = datetime.datetime.fromisoformat(payload["fetched_at"])
+    age_min    = int((datetime.datetime.now() - fetched_at).total_seconds() / 60)
+    log.info(
+        "Using cached data from %s  (fetched %d min ago at %s, panorama=%s)",
+        path, age_min, fetched_at.strftime("%Y-%m-%d %H:%M:%S"), payload.get("panorama", "?"),
+    )
+
+    all_objects = [AddrObject(**o) for o in payload["objects"]]
+    all_groups  = [AddrGroup(**g) for g in payload["groups"]]
+    dg_names    = payload["dg_names"]
+    all_rules   = payload["rules"]
+    usage_map   = payload["usage_map"]
+    return dg_names, all_objects, all_groups, all_rules, usage_map
 
 
 # ── Matching logic ────────────────────────────────────────────────────────────
@@ -461,6 +557,26 @@ def _transitive_groups(name: str, direct_index: dict) -> set:
     return result
 
 
+def _match_to_row(m: RuleMatch) -> dict:
+    return {
+        "server_input":         m.server_input,
+        "resolved_ips":         "|".join(m.resolved_ips),
+        "resolved_names":       "|".join(m.resolved_names),
+        "rule_type":            m.rule_type,
+        "device_group":         m.device_group,
+        "rulebase":             m.rulebase,
+        "rule_name":            m.rule_name,
+        "rule_field":           m.rule_field,
+        "matched_via":          "|".join(m.matched_via),
+        "match_kind":           m.match_kind,
+        "current_sources":      "|".join(m.current_sources),
+        "current_destinations": "|".join(m.current_destinations),
+        "action":               m.action,
+        "disabled":             m.disabled,
+        "rule_usage":           m.rule_usage,
+    }
+
+
 # ── Core search ───────────────────────────────────────────────────────────────
 
 def search_rules(
@@ -470,6 +586,8 @@ def search_rules(
     groups:     list,
     usage_map:  dict,
     dns_info:   dict,
+    csv_writer,         # csv.DictWriter — match written immediately on discovery
+    csv_fh,             # file handle to flush after each write
 ) -> list:
     # Precompute per-DG visibility indexes (objects + groups visible = own DG + shared)
     all_dgs = list({r["dg"] for r in rules})
@@ -488,13 +606,23 @@ def search_rules(
 
     matches: list = []
     seen_keys: set = set()
+    total     = len(rules)
+    report_at = max(50, total // 10)
 
-    for rule in rules:
+    for i, rule in enumerate(rules):
+        if i > 0 and i % report_at == 0:
+            log.info("  ... %d / %d rules scanned (%d match(es) so far)", i, total, len(matches))
+
         rule_dg   = rule["dg"]
         rule_id   = (rule_dg, rule["rulebase"], rule["rule_type"], rule["name"])
-        usage     = usage_map.get(rule["name"], "unknown")
-        vis_objs  = dg_objects.get(rule_dg, [])
-        vis_idx   = dg_direct_index.get(rule_dg, {})
+
+        # Rule usage: op-command map → embedded in XML → unknown
+        usage = usage_map.get(rule["name"])
+        if not usage:
+            usage = rule.get("rule_usage_embedded") or "unknown"
+
+        vis_objs = dg_objects.get(rule_dg, [])
+        vis_idx  = dg_direct_index.get(rule_dg, {})
 
         src_mbrs  = rule.get("source", [])
         dst_mbrs  = rule.get("destination", [])
@@ -502,9 +630,9 @@ def search_rules(
         tdst_mbrs = rule.get("translated_dest", [])
 
         rule_fields = [
-            ("source",                src_mbrs),
-            ("destination",           dst_mbrs),
-            ("translated-source",     tsrc_mbrs),
+            ("source",                 src_mbrs),
+            ("destination",            dst_mbrs),
+            ("translated-source",      tsrc_mbrs),
             ("translated-destination", tdst_mbrs),
         ]
 
@@ -531,7 +659,7 @@ def search_rules(
                 for obj in vis_objs:
                     if not _term_matches_object(term, obj):
                         continue
-                    grps     = _transitive_groups(obj.name, vis_idx)
+                    grps      = _transitive_groups(obj.name, vis_idx)
                     all_names = {obj.name} | grps
 
                     for field_name, mbrs in rule_fields:
@@ -548,7 +676,6 @@ def search_rules(
 
             seen_keys.add(key)
 
-            # Collapse field set: src+dst (or any combination) → "both"
             has_src = bool(hit_fields & {"source", "translated-source"})
             has_dst = bool(hit_fields & {"destination", "translated-destination"})
             if has_src and has_dst:
@@ -559,7 +686,7 @@ def search_rules(
                 rule_field = "|".join(sorted(hit_fields))
 
             r_ips, r_names = dns_info.get(server_input, ([], []))
-            matches.append(RuleMatch(
+            m = RuleMatch(
                 server_input         = server_input,
                 resolved_ips         = r_ips,
                 resolved_names       = r_names,
@@ -575,12 +702,15 @@ def search_rules(
                 action               = rule.get("action", ""),
                 disabled             = rule.get("disabled", "no"),
                 rule_usage           = usage,
-            ))
+            )
+            matches.append(m)
+            csv_writer.writerow(_match_to_row(m))
+            csv_fh.flush()
 
     return matches
 
 
-# ── Output: CSV ───────────────────────────────────────────────────────────────
+# ── Output: CSV fields ────────────────────────────────────────────────────────
 
 CSV_FIELDS = [
     "server_input", "resolved_ips", "resolved_names",
@@ -589,30 +719,6 @@ CSV_FIELDS = [
     "current_sources", "current_destinations",
     "action", "disabled", "rule_usage",
 ]
-
-
-def write_csv(matches: list, path: str) -> None:
-    with open(path, "w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=CSV_FIELDS)
-        writer.writeheader()
-        for m in matches:
-            writer.writerow({
-                "server_input":         m.server_input,
-                "resolved_ips":         "|".join(m.resolved_ips),
-                "resolved_names":       "|".join(m.resolved_names),
-                "rule_type":            m.rule_type,
-                "device_group":         m.device_group,
-                "rulebase":             m.rulebase,
-                "rule_name":            m.rule_name,
-                "rule_field":           m.rule_field,
-                "matched_via":          "|".join(m.matched_via),
-                "match_kind":           m.match_kind,
-                "current_sources":      "|".join(m.current_sources),
-                "current_destinations": "|".join(m.current_destinations),
-                "action":               m.action,
-                "disabled":             m.disabled,
-                "rule_usage":           m.rule_usage,
-            })
 
 
 # ── Output: TXT ───────────────────────────────────────────────────────────────
@@ -733,10 +839,23 @@ def main() -> None:
         "--workers", type=int, default=8,
         help="Parallel API worker threads (default: 8)",
     )
+    parser.add_argument(
+        "--resume", nargs="?", const=DEFAULT_CACHE, metavar="FILE",
+        help=f"Skip API fetch; use cached Panorama data (default: {DEFAULT_CACHE})",
+    )
+    parser.add_argument(
+        "--no-save-cache", dest="save_cache", action="store_false", default=True,
+        help="Do not save a cache file after fetching",
+    )
+    parser.add_argument(
+        "--debug", action="store_true",
+        help="Enable DEBUG logging (shows raw API responses)",
+    )
     args = parser.parse_args()
 
+    log_level = logging.DEBUG if args.debug else logging.INFO
     logging.basicConfig(
-        level=logging.INFO,
+        level=log_level,
         format="%(asctime)s  %(levelname)-8s %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
         stream=sys.stdout,
@@ -776,81 +895,106 @@ def main() -> None:
             ", ".join(r_names) or "(none)",
         )
 
-    # 3. Enumerate device groups
-    log.info("Enumerating device groups...")
-    dg_names = fetch_dg_names()
-    if not dg_names:
-        log.error(
-            "No device groups found. Is TARGET_HOST a Panorama instance? "
-            "Check ops_lib.TARGET_HOST and API_KEY."
+    # 3–10. Fetch Panorama data (or load from cache)
+    if args.resume:
+        cache_file = args.resume
+        try:
+            dg_names, all_objects, all_groups, all_rules, usage_map = load_cache(cache_file)
+        except FileNotFoundError:
+            log.error("Cache file not found: %s", cache_file)
+            sys.exit(1)
+        except Exception as exc:
+            log.error("Failed to load cache: %s", exc)
+            sys.exit(1)
+    else:
+        # 3. Enumerate device groups
+        log.info("Enumerating device groups...")
+        dg_names = fetch_dg_names()
+        if not dg_names:
+            log.error(
+                "No device groups found. Is TARGET_HOST a Panorama instance? "
+                "Check ops_lib.TARGET_HOST and API_KEY."
+            )
+            sys.exit(1)
+        log.info("  %d DG(s): %s", len(dg_names), ", ".join(dg_names))
+
+        # 4 & 5. Fetch address objects + groups in parallel (shared + all DGs)
+        log.info("Fetching address objects and groups...")
+        all_objects: list = []
+        all_groups:  list = []
+        scopes = ["shared"] + dg_names
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as ex:
+            obj_futs = {ex.submit(fetch_address_objects, dg): dg for dg in scopes}
+            grp_futs = {ex.submit(fetch_address_groups,  dg): dg for dg in scopes}
+            for fut in concurrent.futures.as_completed(obj_futs):
+                all_objects.extend(fut.result())
+            for fut in concurrent.futures.as_completed(grp_futs):
+                all_groups.extend(fut.result())
+        log.info("  %d address object(s), %d address group(s)", len(all_objects), len(all_groups))
+
+        # 6–9. Fetch all security + NAT rules in parallel (pre + post, all DGs)
+        log.info("Fetching rules from %d device group(s)...", len(dg_names))
+        all_rules: list = []
+        tasks = [
+            (dg, rb, rt)
+            for dg in dg_names
+            for rb in ("pre", "post")
+            for rt in ("security", "nat")
+        ]
+        dg_counts: dict = defaultdict(int)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as ex:
+            rule_futs = {
+                ex.submit(fetch_one_rule_set, dg, rb, rt): (dg, rb, rt)
+                for dg, rb, rt in tasks
+            }
+            for fut in concurrent.futures.as_completed(rule_futs):
+                rules = fut.result()
+                dg, rb, rt = rule_futs[fut]
+                all_rules.extend(rules)
+                dg_counts[dg] += len(rules)
+        for dg in sorted(dg_counts):
+            log.info("  %-32s : %d rule(s)", dg, dg_counts[dg])
+        log.info("  %d total rule(s)", len(all_rules))
+
+        # 10. Fetch rule usage stats per DG
+        log.info("Fetching rule usage stats...")
+        usage_map: dict = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as ex:
+            usage_futs = {ex.submit(fetch_rule_usage, dg): dg for dg in dg_names}
+            for fut in concurrent.futures.as_completed(usage_futs):
+                dg = usage_futs[fut]
+                result = fut.result()
+                if result:
+                    usage_map.update(result)
+                else:
+                    log.info(
+                        "  Rule usage unavailable for DG: %s (will use embedded data or 'unknown')",
+                        dg,
+                    )
+        log.info("  %d rule(s) with usage data", len(usage_map))
+
+        # Save cache
+        if args.save_cache:
+            try:
+                save_cache(DEFAULT_CACHE, dg_names, all_objects, all_groups, all_rules, usage_map)
+            except Exception as exc:
+                log.warning("Failed to save cache: %s", exc)
+
+    # 11. Match rules — CSV written incrementally as matches are found
+    log.info("Matching rules (%d total)...", len(all_rules))
+    with open(csv_path, "w", newline="", encoding="utf-8") as csv_fh:
+        writer = csv.DictWriter(csv_fh, fieldnames=CSV_FIELDS)
+        writer.writeheader()
+        csv_fh.flush()
+        matches = search_rules(
+            all_rules, all_idents, all_objects, all_groups,
+            usage_map, dns_info, writer, csv_fh,
         )
-        sys.exit(1)
-    log.info("  %d DG(s): %s", len(dg_names), ", ".join(dg_names))
-
-    # 4 & 5. Fetch address objects + groups in parallel (shared + all DGs)
-    log.info("Fetching address objects and groups...")
-    all_objects: list = []
-    all_groups:  list = []
-    scopes = ["shared"] + dg_names
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as ex:
-        obj_futs = {ex.submit(fetch_address_objects, dg): dg for dg in scopes}
-        grp_futs = {ex.submit(fetch_address_groups,  dg): dg for dg in scopes}
-        for fut in concurrent.futures.as_completed(obj_futs):
-            all_objects.extend(fut.result())
-        for fut in concurrent.futures.as_completed(grp_futs):
-            all_groups.extend(fut.result())
-    log.info("  %d address object(s), %d address group(s)", len(all_objects), len(all_groups))
-
-    # 6–9. Fetch all security + NAT rules in parallel (pre + post, all DGs)
-    log.info("Fetching rules from %d device group(s)...", len(dg_names))
-    all_rules: list = []
-    tasks = [
-        (dg, rb, rt)
-        for dg in dg_names
-        for rb in ("pre", "post")
-        for rt in ("security", "nat")
-    ]
-    dg_counts: dict = defaultdict(int)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as ex:
-        rule_futs = {
-            ex.submit(fetch_one_rule_set, dg, rb, rt): (dg, rb, rt)
-            for dg, rb, rt in tasks
-        }
-        for fut in concurrent.futures.as_completed(rule_futs):
-            rules = fut.result()
-            dg, rb, rt = rule_futs[fut]
-            all_rules.extend(rules)
-            dg_counts[dg] += len(rules)
-    for dg in sorted(dg_counts):
-        log.info("  %-32s : %d rule(s)", dg, dg_counts[dg])
-    log.info("  %d total rule(s)", len(all_rules))
-
-    # 10. Fetch rule usage stats per DG
-    log.info("Fetching rule usage stats...")
-    usage_map: dict = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as ex:
-        usage_futs = {ex.submit(fetch_rule_usage, dg): dg for dg in dg_names}
-        for fut in concurrent.futures.as_completed(usage_futs):
-            dg = usage_futs[fut]
-            result = fut.result()
-            if result:
-                usage_map.update(result)
-            else:
-                log.info("  Rule usage unavailable for DG: %s (will show 'unknown')", dg)
-    log.info("  %d rule(s) with usage data", len(usage_map))
-
-    # 11. Match rules against search terms
-    log.info("Matching rules...")
-    matches = search_rules(all_rules, all_idents, all_objects, all_groups, usage_map, dns_info)
     log.info("  %d match(es) found", len(matches))
 
-    # 12. Write output
-    write_csv(matches, csv_path)
-    log.info("CSV: %s", csv_path)
-
+    # 12. Write TXT report
     write_txt(matches, args.input_file, started, len(servers), total_terms, txt_path)
-    log.info("TXT: %s", txt_path)
 
     finished = datetime.datetime.now()
     duration = str(finished - started).split(".")[0]
@@ -865,7 +1009,8 @@ def main() -> None:
             "\nNo matches found. Check that:\n"
             "  - Input IPs/FQDNs match actual address object values in Panorama\n"
             "  - API key has read access to device-group config\n"
-            "  - TARGET_HOST in ops_lib.py points to Panorama (not a direct firewall)"
+            "  - TARGET_HOST in libs/ops_lib.py points to Panorama (not a direct firewall)\n"
+            "  - Try --debug to see raw API responses"
         )
 
 
