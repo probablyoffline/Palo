@@ -65,7 +65,7 @@ Options:
 
 Output .txt sections (in order):
     SUMMARY          — counters, file paths, PCI breakdown (if applicable)
-    NOTES            — per-design warnings (inferred apps, dropped ports, etc.)
+    NOTES            — per-design warnings (named service objects, dropped ports, etc.)
     NEW RULES        — APP-ID-*, APP-ID-*-UNKNOWN, APP-ID-*-NS creations
     RULE UPDATES     — tag additions to existing rules (app-id-under-review, etc.)
     PCI — NEW RULES  — same as NEW RULES, PCI-scoped rules only (if applicable)
@@ -78,7 +78,6 @@ Design logic:
   - incomplete / not-applicable → excluded silently
   - Risky apps → risky-app tag added
   - Non-standard port traffic → separate APP-ID-<name>-NS rule
-  - Apps inferred from observed/configured ports (≤3 apps claim that port)
   - All new rules get: app-id-new-rule
   - Old rules with new rules get: app-id-under-review
   - Old rules with no traffic get: app-id-review-unused
@@ -102,10 +101,9 @@ requests.packages.urllib3.disable_warnings()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-__version__ = "1.10.6"
+__version__ = "1.10.7"
 
 APP_REVIEW_THRESHOLD     = 10  # flag designs with this many or more usable apps
-PORT_INFERENCE_THRESHOLD = 3   # infer app from port only when ≤ this many apps claim it
 APP_FETCH_BATCH          = 50  # max apps per XPath filter to avoid PAN-OS XPath length limits
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -450,31 +448,6 @@ def fetch_all_predefined_ports() -> dict[str, set[str]]:
 
     return port_map
 
-
-# ── App inference helpers ─────────────────────────────────────────────────────
-
-def infer_apps_from_ports(
-    ports: set[str],
-    port_app_map: dict[str, set[str]],
-    already_known: set[str],
-    threshold: int,
-) -> list[str]:
-    """
-    For each port, look up which apps claim it as a standard port.
-    If ≤ threshold apps claim it, add any not already in already_known.
-    Returns sorted list of newly-inferred app names.
-    """
-    inferred: list[str] = []
-    for port in sorted(ports):
-        candidates = port_app_map.get(port.lower(), set())
-        if len(candidates) <= threshold:
-            for app in sorted(candidates):
-                if (app not in already_known
-                        and app not in NON_APP_VALUES
-                        and app not in UNKNOWN_APP_VALUES
-                        and app not in inferred):
-                    inferred.append(app)
-    return inferred
 
 
 def parse_app_port_details(raw: str) -> dict[str, set[str]]:
@@ -1111,19 +1084,15 @@ def main() -> None:
                     sp_path, require=True, label="standard-ports"
                 )
 
-    # ── Full app-port map for inference (all predefined apps, unfiltered) ─────
+    # ── Full app-port map for NS classification (all predefined apps) ──────────
     full_app_port_map: dict[str, set[str]] = {}
-    port_app_map:      dict[str, set[str]] = {}
 
     if not args.static_ports and dynamic_available:
-        print("  Fetching full app-port map for inference ...", end=" ", flush=True)
+        print("  Fetching full app-port map ...", end=" ", flush=True)
         full_app_port_map = fetch_all_predefined_ports()
         n_total   = len(full_app_port_map)
         n_w_ports = sum(1 for v in full_app_port_map.values() if v)
         print(f"{n_total} apps, {n_w_ports} with defined ports")
-        for app, ports in full_app_port_map.items():
-            for port in ports:
-                port_app_map.setdefault(port.lower(), set()).add(app)
 
     print()
 
@@ -1143,7 +1112,6 @@ def main() -> None:
     update_count               = 0
     unused_count               = 0
     named_service_count        = 0
-    inferred_count             = 0
     pci_design_count           = 0
     pci_new_rule_count         = 0
     pci_update_count           = 0
@@ -1175,15 +1143,6 @@ def main() -> None:
             if not has_named_service else []
         )
 
-        # ── App inference from observed (or configured) ports ─────────────────
-        inferred_apps: list[str] = []
-        if dynamic_available and port_app_map:
-            inference_source = observed_ports if observed_ports else set(valid_configured)
-            all_known = set(usable_apps) | UNKNOWN_APP_VALUES | NON_APP_VALUES
-            inferred_apps = infer_apps_from_ports(
-                inference_source, port_app_map, all_known, PORT_INFERENCE_THRESHOLD
-            )
-
         # ── Classify observed apps: standard-port vs non-standard-port ────────
         std_observed_apps:   list[str] = []
         nonst_observed_apps: list[str] = []
@@ -1212,8 +1171,7 @@ def main() -> None:
         else:
             std_observed_apps = list(usable_apps)
 
-        # main rule: standard observed + inferred (inferred are by-definition standard-port)
-        main_apps  = list(dict.fromkeys(std_observed_apps + inferred_apps))
+        main_apps  = list(dict.fromkeys(std_observed_apps))
         # NONSTANDARD rule: apps seen on non-standard ports
         nonst_apps = list(dict.fromkeys(nonst_observed_apps))
 
@@ -1272,9 +1230,6 @@ def main() -> None:
         new_rule_tags: list[str] = list(config.existing_tags) + [TAG_NEW_RULE]
         if has_risky:
             new_rule_tags.append(TAG_RISKY)
-
-        if inferred_apps:
-            inferred_count += 1
 
         # ── Check for existing APP-ID rules ───────────────────────────────────
         known_exists       = configs[f"APP-ID-{rule_name}"].found
@@ -1350,12 +1305,6 @@ def main() -> None:
                 f"Design {first_num} — {rule_name}",
                 f"service config contains named objects/groups — application-default used. "
                 f"Original service: {ports_raw}",
-            ))
-        if inferred_apps:
-            src = "observed dports" if observed_ports else "configured ports"
-            notes.append((
-                f"Design {first_num} — {rule_name}",
-                f"apps inferred from {src}: {', '.join(inferred_apps)} — verify before implementing.",
             ))
         if unknown_std_apps:
             notes.append((
@@ -1584,10 +1533,9 @@ def main() -> None:
             f", {pci_update_count} tag update(s)"
             + (f"  →  {pci_csv_path}" if not args.no_csv else "")
         )
-    if named_service_count or inferred_count:
+    if named_service_count:
         summary_lines.append(
-            f"Inference   : {inferred_count} rule(s) with inferred apps"
-            f", {named_service_count} rule(s) with named service objects (→ application-default)"
+            f"Named svc   : {named_service_count} rule(s) with named service objects (→ application-default)"
         )
     preamble = ["\n".join(summary_lines)]
 
@@ -1634,9 +1582,8 @@ def main() -> None:
         print(f"  PCI: {pci_design_count} design(s)"
               f"  |  {pci_new_rule_count} new rule(s)"
               f"  |  {pci_update_count} tag update(s)")
-    if named_service_count or inferred_count:
-        print(f"  {inferred_count} rule(s) with inferred apps"
-              f"  |  {named_service_count} rule(s) with named service objects")
+    if named_service_count:
+        print(f"  {named_service_count} rule(s) with named service objects (→ application-default)")
     print(f"  Text : {txt_path}")
     if not args.no_csv:
         print(f"  CSV  : {csv_path}")
