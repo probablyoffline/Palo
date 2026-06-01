@@ -407,16 +407,16 @@ def _parse_usage_result(result: ET.Element) -> dict:
 
 def fetch_rule_usage(dg: str) -> tuple:
     """
-    Return (unused_names: set[str], succeeded: bool) for a DG.
+    Return (used_names: set[str], succeeded: bool) for a DG.
 
-    Queries Panorama for rules marked unused.  Rules NOT in the returned set
-    but belonging to this DG should be treated as "used".  On query failure,
+    Queries Panorama for rules marked used.  Rules NOT in the returned set
+    but belonging to this DG are inferred as "unused".  On query failure,
     succeeded=False and callers should fall back to embedded data or "unknown".
     """
     cmd = (
         f"<show><rule-use><rule-base>security</rule-base>"
         f"<device-group>{dg}</device-group>"
-        f"<type>unused</type>"
+        f"<type>used</type>"
         f"</rule-use></show>"
     )
     result = api_op(cmd)
@@ -424,12 +424,12 @@ def fetch_rule_usage(dg: str) -> tuple:
         log.debug("fetch_rule_usage: query failed for DG: %s", dg)
         return set(), False
 
-    unused: set = set()
+    used: set = set()
     for entry in result.iter("entry"):
         name = entry.get("name", "")
         if name:
-            unused.add(name)
-    return unused, True
+            used.add(name)
+    return used, True
 
 
 # ── Cache: save / load ────────────────────────────────────────────────────────
@@ -440,7 +440,7 @@ def save_cache(
     all_objects: list,
     all_groups: list,
     all_rules: list,
-    unused_map: dict,   # {rule_name: "unused"}
+    used_map: dict,     # {rule_name: "used"}
     queried_dgs: set,   # DGs where the usage query succeeded
 ) -> None:
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -451,7 +451,7 @@ def save_cache(
         "objects":     [dataclasses.asdict(o) for o in all_objects],
         "groups":      [dataclasses.asdict(g) for g in all_groups],
         "rules":       all_rules,
-        "unused_map":  unused_map,
+        "used_map":    used_map,
         "queried_dgs": sorted(queried_dgs),
     }
     with open(path, "w", encoding="utf-8") as fh:
@@ -475,10 +475,9 @@ def load_cache(path: str) -> tuple:
     all_groups  = [AddrGroup(**g) for g in payload["groups"]]
     dg_names    = payload["dg_names"]
     all_rules   = payload["rules"]
-    # Support old cache files that used usage_map instead of unused_map
-    unused_map  = payload.get("unused_map") or payload.get("usage_map", {})
+    used_map    = payload.get("used_map", {})
     queried_dgs = set(payload.get("queried_dgs", []))
-    return dg_names, all_objects, all_groups, all_rules, unused_map, queried_dgs
+    return dg_names, all_objects, all_groups, all_rules, used_map, queried_dgs
 
 
 # ── Matching logic ────────────────────────────────────────────────────────────
@@ -585,8 +584,8 @@ def search_rules(
     all_idents:  dict,   # {server_input: [term, ...]}
     objects:     list,
     groups:      list,
-    unused_map:  dict,   # {rule_name: "unused"} — rules confirmed unused by Panorama
-    queried_dgs: set,    # DGs where usage query succeeded; absent rule → "used"
+    used_map:    dict,   # {rule_name: "used"} — rules confirmed used by Panorama
+    queried_dgs: set,    # DGs where usage query succeeded; absent rule → "unused"
     dns_info:    dict,
     csv_writer,          # csv.DictWriter — match written immediately on discovery
     csv_fh,              # file handle to flush after each write
@@ -618,11 +617,11 @@ def search_rules(
         rule_dg   = rule["dg"]
         rule_id   = (rule_dg, rule["rulebase"], rule["rule_type"], rule["name"])
 
-        # Rule usage: unused query → infer used → embedded XML → unknown
-        if rule["name"] in unused_map:
-            usage = "unused"
-        elif rule_dg in queried_dgs:
+        # Rule usage: used query → infer unused → embedded XML → unknown
+        if rule["name"] in used_map:
             usage = "used"
+        elif rule_dg in queried_dgs:
+            usage = "unused"
         else:
             usage = rule.get("rule_usage_embedded") or "unknown"
 
@@ -904,7 +903,7 @@ def main() -> None:
     if args.resume:
         cache_file = args.resume
         try:
-            dg_names, all_objects, all_groups, all_rules, unused_map, queried_dgs = load_cache(cache_file)
+            dg_names, all_objects, all_groups, all_rules, used_map, queried_dgs = load_cache(cache_file)
         except FileNotFoundError:
             log.error("Cache file not found: %s", cache_file)
             sys.exit(1)
@@ -964,25 +963,25 @@ def main() -> None:
 
         # 10. Fetch rule usage stats per DG
         log.info("Fetching rule usage stats...")
-        unused_map:  dict = {}
+        used_map:    dict = {}
         queried_dgs: set  = set()
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as ex:
             usage_futs = {ex.submit(fetch_rule_usage, dg): dg for dg in dg_names}
             for fut in concurrent.futures.as_completed(usage_futs):
                 dg = usage_futs[fut]
-                unused_names, succeeded = fut.result()
+                used_names, succeeded = fut.result()
                 if succeeded:
                     queried_dgs.add(dg)
-                    for name in unused_names:
-                        unused_map[name] = "unused"
+                    for name in used_names:
+                        used_map[name] = "used"
                 else:
                     log.info(
                         "  Rule usage unavailable for DG: %s (will use embedded data or 'unknown')",
                         dg,
                     )
         log.info(
-            "  %d DG(s) queried successfully, %d unused rule(s) identified",
-            len(queried_dgs), len(unused_map),
+            "  %d DG(s) queried successfully, %d used rule(s) identified",
+            len(queried_dgs), len(used_map),
         )
 
         # Save cache
@@ -990,7 +989,7 @@ def main() -> None:
             try:
                 save_cache(
                     DEFAULT_CACHE, dg_names, all_objects, all_groups,
-                    all_rules, unused_map, queried_dgs,
+                    all_rules, used_map, queried_dgs,
                 )
             except Exception as exc:
                 log.warning("Failed to save cache: %s", exc)
@@ -1003,7 +1002,7 @@ def main() -> None:
         csv_fh.flush()
         matches = search_rules(
             all_rules, all_idents, all_objects, all_groups,
-            unused_map, queried_dgs, dns_info, writer, csv_fh,
+            used_map, queried_dgs, dns_info, writer, csv_fh,
         )
     log.info("  %d match(es) found", len(matches))
 
