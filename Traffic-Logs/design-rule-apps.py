@@ -76,7 +76,7 @@ Design logic:
   - Rules with no traffic (skipped) or no apps found → tag update only
   - unknown-tcp / unknown-udp → excluded from app list, separate UNKNOWN rule
   - incomplete / not-applicable → excluded silently
-  - Risky apps → risky-app tag added
+  - Risky apps → separate APP-ID-<name>-RISKY rule; risky-app tag
   - Non-standard port traffic → separate APP-ID-<name>-NS rule
   - All new rules get: app-id-new-rule
   - Old rules with new rules get: app-id-under-review
@@ -101,7 +101,7 @@ requests.packages.urllib3.disable_warnings()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-__version__ = "1.10.7"
+__version__ = "1.11.0"
 
 APP_REVIEW_THRESHOLD     = 10  # flag designs with this many or more usable apps
 APP_FETCH_BATCH          = 50  # max apps per XPath filter to avoid PAN-OS XPath length limits
@@ -341,7 +341,9 @@ def _parse_app_ports_to_set(entry: ET.Element) -> set[str]:
     return result
 
 
-def fetch_app_default_ports(app_names: list[str]) -> tuple[dict[str, set[str]], bool]:
+def fetch_app_default_ports(
+    app_names: list[str],
+) -> tuple[dict[str, set[str]], dict[str, str], bool]:
     """
     Query Panorama/firewall for the official standard ports of each application.
 
@@ -350,17 +352,19 @@ def fetch_app_default_ports(app_names: list[str]) -> tuple[dict[str, set[str]], 
       2. /config/shared/application      — shared custom apps (Panorama only)
       3. DG or vsys custom apps          — org-defined apps
 
-    Returns (port_map, api_available):
-      port_map:       {app_name: set of 'tcp-80' style strings}
-                      Empty set means the app has no defined default ports (e.g. ident-by-ip).
-      api_available:  True if at least one API source responded successfully.
+    Returns (port_map, child_to_parent, api_available):
+      port_map:         {app_name: set of 'tcp-80' style strings}
+                        Empty set means the app has no defined default ports (e.g. ident-by-ip).
+      child_to_parent:  {child_app: parent_app} for apps that declare a parent-app element.
+      api_available:    True if at least one API source responded successfully.
     """
     wanted = {a for a in app_names
               if a and a not in NON_APP_VALUES and a not in UNKNOWN_APP_VALUES}
     if not wanted:
-        return {}, True
+        return {}, {}, True
 
     port_map: dict[str, set[str]] = {name: set() for name in wanted}
+    child_to_parent: dict[str, str] = {}
     api_available = False
 
     # Process in batches to avoid PAN-OS XPath length limits on large app sets.
@@ -403,8 +407,11 @@ def fetch_app_default_ports(app_names: list[str]) -> tuple[dict[str, set[str]], 
                 if name in wanted:
                     ports = _parse_app_ports_to_set(entry)
                     port_map[name] |= ports
+                    parent_el = entry.find("parent-app")
+                    if parent_el is not None and parent_el.text and name not in child_to_parent:
+                        child_to_parent[name] = parent_el.text.strip()
 
-    return port_map, api_available
+    return port_map, child_to_parent, api_available
 
 
 def fetch_all_predefined_ports() -> dict[str, set[str]]:
@@ -806,6 +813,43 @@ def format_nonstandard_rule_design(
     return "\n".join(lines)
 
 
+def format_risky_rule_design(
+    design_number:  int | str,
+    rule_name:      str,
+    config:         RuleConfig,
+    risky_apps:     list[str],
+    device_group:   str,
+    run_month_year: str,
+) -> str:
+    tags = list(config.existing_tags) + [TAG_NEW_RULE, TAG_RISKY]
+
+    lines = [f"Design {design_number}", ""]
+    lines += [
+        f"In {device_group}",
+        f"Clone Rule ABOVE: {rule_name}",
+        f"New Rule Name: APP-ID-{rule_name}-RISKY",
+        f"Description: DDD created {run_month_year}",
+        f"Tags: {_csv_list(tags)}",
+        "",
+        f"Source Zone: {_csv_list(config.source_zones)}",
+        f"Source Address: {_csv_list(config.source_addrs)}",
+    ]
+    non_any_users = [u for u in config.source_users if u.lower() != "any"]
+    if non_any_users:
+        lines.append(f"Source User: {_csv_list(non_any_users)}")
+    lines += [
+        "",
+        f"Dest Zone: {_csv_list(config.dest_zones)}",
+        f"Dest Address: {_csv_list(config.dest_addrs)}",
+        "",
+        f"Application: {_csv_list(risky_apps)}",
+        "Port: application-default",
+        f"Action: {config.action}",
+        f"Group profile: {config.group_profile or '(none)'}",
+    ]
+    return "\n".join(lines)
+
+
 def format_app_update_design(
     design_number: int | str,
     rule_name:     str,
@@ -1046,6 +1090,7 @@ def main() -> None:
         [f"APP-ID-{n}" for n in rule_names]
         + [f"APP-ID-{n}-UNKNOWN" for n in rule_names]
         + [f"APP-ID-{n}-NS" for n in rule_names]
+        + [f"APP-ID-{n}-RISKY" for n in rule_names]
     )
 
     print(f"  Fetching rule configs for {len(rule_names)} rules ...", end=" ", flush=True)
@@ -1060,6 +1105,7 @@ def main() -> None:
     # dynamic_available: True  → use per-rule union of app default ports
     #                    False → fall back to static_standard_ports
     app_port_map: dict[str, set[str]] = {}
+    child_to_parent: dict[str, str] = {}
     dynamic_available = False
 
     if not args.static_ports:
@@ -1073,7 +1119,7 @@ def main() -> None:
                 f"  Fetching standard ports for {len(all_usable)} unique apps ...",
                 end=" ", flush=True,
             )
-            app_port_map, dynamic_available = fetch_app_default_ports(list(all_usable))
+            app_port_map, child_to_parent, dynamic_available = fetch_app_default_ports(list(all_usable))
 
             if dynamic_available:
                 n_with_ports = sum(1 for v in app_port_map.values() if v)
@@ -1094,6 +1140,15 @@ def main() -> None:
         n_w_ports = sum(1 for v in full_app_port_map.values() if v)
         print(f"{n_total} apps, {n_w_ports} with defined ports")
 
+        # Propagate parent app ports to child apps with no defined ports.
+        # PAN-OS defines ports on the parent entry only; child entries inherit but
+        # do not repeat the port list in the predefined XML.
+        for _app, _parent in child_to_parent.items():
+            if not app_port_map.get(_app):
+                _inherited = full_app_port_map.get(_parent, set()) | app_port_map.get(_parent, set())
+                if _inherited:
+                    app_port_map[_app] = _inherited
+
     print()
 
     device_group           = ops_lib.DEVICE_GROUP
@@ -1108,6 +1163,7 @@ def main() -> None:
     new_rule_count             = 0
     unknown_rule_count         = 0
     nonstandard_rule_count     = 0
+    risky_rule_count           = 0
     app_update_count           = 0
     update_count               = 0
     unused_count               = 0
@@ -1129,6 +1185,8 @@ def main() -> None:
         pci          = is_pci_rule(config, pci_tags)
 
         usable_apps, unknown_apps, has_risky = classify_apps(apps_raw, risky_apps)
+        risky_app_list = [a for a in usable_apps if a.lower() in risky_apps]
+        clean_usable   = [a for a in usable_apps if a.lower() not in risky_apps]
         has_unknown = bool(unknown_apps)
 
         # ── Parse observed port data ──────────────────────────────────────────
@@ -1150,7 +1208,7 @@ def main() -> None:
 
         unknown_std_apps: list[str] = []  # observed apps with no standard port data
         if dynamic_available and app_port_obs:
-            for app in usable_apps:
+            for app in clean_usable:
                 app_std     = app_port_map.get(app, set()) | full_app_port_map.get(app, set())
                 obs_for_app = app_port_obs.get(app, set())
                 if not app_std and obs_for_app:
@@ -1169,13 +1227,13 @@ def main() -> None:
                 elif not app_nonst:               # no observed data or fully standard
                     std_observed_apps.append(app)
         else:
-            std_observed_apps = list(usable_apps)
+            std_observed_apps = list(clean_usable)
 
         main_apps  = list(dict.fromkeys(std_observed_apps))
         # NONSTANDARD rule: apps seen on non-standard ports
         nonst_apps = list(dict.fromkeys(nonst_observed_apps))
 
-        has_no_apps = not main_apps and not nonst_apps and not has_unknown
+        has_no_apps = not main_apps and not nonst_apps and not has_unknown and not risky_app_list
 
         if complete == "no" and has_no_apps:
             print(f"  Skipping {rule_name} — query incomplete (complete=no) with no apps found.")
@@ -1226,19 +1284,19 @@ def main() -> None:
 
         service, _ = determine_port_setting(effective_ports_raw, rule_std_ports)
 
-        # Main rule never gets TAG_NON_STANDARD — non-std traffic goes to NONSTANDARD rule
+        # Main rule never gets TAG_NON_STANDARD or TAG_RISKY — those go to their own rules
         new_rule_tags: list[str] = list(config.existing_tags) + [TAG_NEW_RULE]
-        if has_risky:
-            new_rule_tags.append(TAG_RISKY)
 
         # ── Check for existing APP-ID rules ───────────────────────────────────
         known_exists       = configs[f"APP-ID-{rule_name}"].found
         unknown_exists     = configs[f"APP-ID-{rule_name}-UNKNOWN"].found
         nonstandard_exists = configs[f"APP-ID-{rule_name}-NS"].found
+        risky_exists       = configs[f"APP-ID-{rule_name}-RISKY"].found
 
-        generate_known       = bool(main_apps)    and not known_exists
-        generate_unknown     = bool(unknown_apps) and not unknown_exists
+        generate_known       = bool(main_apps)       and not known_exists
+        generate_unknown     = bool(unknown_apps)    and not unknown_exists
         generate_nonstandard = bool(nonst_apps) and bool(nonst_ports) and not nonstandard_exists
+        generate_risky       = bool(risky_app_list)  and not risky_exists
 
         # ── Pre-assign design numbers ─────────────────────────────────────────
         known_num           = None
@@ -1246,6 +1304,7 @@ def main() -> None:
         app_update_num      = None
         nonstandard_num     = None
         nonstandard_upd_num = None
+        risky_num           = None
 
         if generate_known:
             if pci:
@@ -1281,6 +1340,14 @@ def main() -> None:
                 design_count += 1; nonstandard_upd_num = design_count
                 app_update_count += 1
 
+        if generate_risky:
+            if pci:
+                pci_design_count += 1; risky_num = f"PCI-{pci_design_count}"
+                pci_new_rule_count += 1
+            else:
+                design_count += 1; risky_num = design_count
+                risky_rule_count += 1
+
         if pci:
             pci_design_count += 1; update_num = f"PCI-{pci_design_count}"
             pci_update_count += 1
@@ -1293,6 +1360,7 @@ def main() -> None:
                      app_update_num      if app_update_num      is not None else
                      unknown_num         if unknown_num         is not None else
                      nonstandard_num     if nonstandard_num     is not None else
+                     risky_num          if risky_num           is not None else
                      update_num)
 
         if not config.found:
@@ -1352,7 +1420,18 @@ def main() -> None:
             notes.append((
                 f"Design {nonstandard_num} — {rule_name}",
                 f"non-standard port traffic detected: {', '.join(sorted(nonst_ports))} — "
-                f"separate NONSTANDARD rule generated.",
+                f"separate NS rule generated.",
+            ))
+        if risky_exists and risky_app_list:
+            notes.append((
+                f"Design {update_num} — {rule_name}",
+                f"APP-ID-{rule_name}-RISKY already exists — risky-app rule design skipped.",
+            ))
+        if generate_risky:
+            notes.append((
+                f"Design {risky_num} — {rule_name}",
+                f"risky app(s) detected: {', '.join(risky_app_list)} — "
+                f"separate RISKY rule generated.",
             ))
         if generate_unknown:
             has_main_design = generate_known or app_update_num is not None
@@ -1432,6 +1511,16 @@ def main() -> None:
                 rule_suffix   = "-NS",
             ))
 
+        if generate_risky:
+            _new_designs.append(format_risky_rule_design(
+                design_number  = risky_num,
+                rule_name      = rule_name,
+                config         = config,
+                risky_apps     = risky_app_list,
+                device_group   = device_group,
+                run_month_year = run_month_year,
+            ))
+
         _upd_designs.append(format_rule_update(update_num, rule_name, TAG_UNDER_REVIEW, device_group, run_month_year))
 
         # ── CSV rows ──────────────────────────────────────────────────────────
@@ -1502,11 +1591,33 @@ def main() -> None:
             elif nonstandard_upd_num is not None:
                 _csv.append(build_app_update_row(rule_name, nonst_apps, device_group, rule_suffix="-NS"))
 
+            if generate_risky:
+                risky_tags = list(config.existing_tags) + [TAG_NEW_RULE, TAG_RISKY]
+                non_any_users = [u for u in config.source_users if u.lower() != "any"]
+                _csv.append({
+                    "type":             "new_rule",
+                    "device_group":     device_group,
+                    "rule_name":        f"APP-ID-{rule_name}-RISKY",
+                    "clone_above":      rule_name,
+                    "description":      f"DDD created {run_month_year}",
+                    "tags":             "|".join(risky_tags),
+                    "source_zones":     "|".join(config.source_zones),
+                    "source_addresses": "|".join(config.source_addrs),
+                    "source_user":      "|".join(non_any_users),
+                    "dest_zones":       "|".join(config.dest_zones),
+                    "dest_addresses":   "|".join(config.dest_addrs),
+                    "applications":     "|".join(risky_app_list),
+                    "service":          "application-default",
+                    "action":           config.action,
+                    "group_profile":    config.group_profile,
+                    "tags_to_add":      "",
+                })
+
             _csv.append(build_tag_update_row(rule_name, TAG_UNDER_REVIEW, device_group))
 
     SEP = "=" * 62
 
-    total_new     = new_rule_count + unknown_rule_count + nonstandard_rule_count
+    total_new     = new_rule_count + unknown_rule_count + nonstandard_rule_count + risky_rule_count
     total_designs = design_count + pci_design_count
     summary_lines = [
         "SUMMARY",
@@ -1519,7 +1630,7 @@ def main() -> None:
         "",
         f"Designs     : {total_designs} total"
         f" — {total_new} new rule(s)"
-        f" ({nonstandard_rule_count} NONSTANDARD)"
+        f" ({nonstandard_rule_count} NS, {risky_rule_count} RISKY)"
         f", {app_update_count} app update(s)"
         f", {update_count} tag update(s)"
         f", {unused_count} unused (no traffic)",
@@ -1574,7 +1685,7 @@ def main() -> None:
 
     print("=" * 62)
     print(f"  {total_designs} design(s) total")
-    print(f"  {total_new} new rule(s) ({nonstandard_rule_count} NONSTANDARD)"
+    print(f"  {total_new} new rule(s) ({nonstandard_rule_count} NS, {risky_rule_count} RISKY)"
           f"  |  {app_update_count} app update(s)"
           f"  |  {update_count} tag update(s)"
           f"  |  {unused_count} unused (no traffic)")
