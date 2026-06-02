@@ -1,4 +1,4 @@
-# risky-apps.txt
+# risky-apps.txt  v1.0.0
 #
 # Applications listed here are considered risky to the organization.
 # If any of these apps are observed in a rule's traffic, the new App-ID

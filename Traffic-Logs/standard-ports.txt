@@ -1,4 +1,4 @@
-# standard-ports.txt
+# standard-ports.txt  v1.1.0
 #
 # Used in two ways by design-rule-apps.py:
 #
@@ -75,5 +75,9 @@ syslog:tcp-514
 syslog:udp-514
 
 # ── Per-app overrides ─────────────────────────────────────────────────────────
-# tcp-135 is the RPC endpoint mapper — should only carry msrpc traffic.
+# tcp-135 is the RPC endpoint mapper — msrpc-base is a child of msrpc.
+# Panorama defines the port on the parent entry only, not the child entry.
 msrpc:tcp-135
+msrpc-base:tcp-135
+# udp-1434 is the SQL Server Browser service port (standard for mssql-mon).
+mssql-mon:udp-1434
