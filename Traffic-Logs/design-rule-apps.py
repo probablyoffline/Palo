@@ -101,7 +101,7 @@ requests.packages.urllib3.disable_warnings()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-__version__ = "1.11.0"
+__version__ = "1.11.2"
 
 APP_REVIEW_THRESHOLD     = 10  # flag designs with this many or more usable apps
 APP_FETCH_BATCH          = 50  # max apps per XPath filter to avoid PAN-OS XPath length limits
@@ -1268,10 +1268,13 @@ def main() -> None:
                 combined_std |= app_port_map.get(app, set())
                 combined_std |= full_app_port_map.get(app, set())
                 combined_std |= per_app_standard_ports.get(app, set())
+                # The NS loop classified this app as standard; its observed ports
+                # are therefore standard in this rule's context.
+                combined_std |= app_port_obs.get(app, set())
             combined_std |= static_standard_ports
             if observed_ports:
                 filtered = [p for p in valid_configured
-                            if p == "application-default" or (p in observed_ports and p not in nonst_ports)]
+                            if p in observed_ports and p not in nonst_ports]
             else:
                 filtered = [p for p in valid_configured
                             if p == "application-default" or p in combined_std]
@@ -1282,7 +1285,13 @@ def main() -> None:
             effective_ports_raw = ports_raw
             rule_std_ports = static_standard_ports
 
-        service, _ = determine_port_setting(effective_ports_raw, rule_std_ports)
+        # When per-app port attribution data exists in dynamic mode, the NS
+        # classification already confirmed all main_apps are standard.
+        # Skip determine_port_setting and use application-default directly.
+        if observed_ports and dynamic_available:
+            service = "application-default"
+        else:
+            service, _ = determine_port_setting(effective_ports_raw, rule_std_ports)
 
         # Main rule never gets TAG_NON_STANDARD or TAG_RISKY — those go to their own rules
         new_rule_tags: list[str] = list(config.existing_tags) + [TAG_NEW_RULE]
@@ -1387,7 +1396,7 @@ def main() -> None:
         if dropped:
             notes.append((
                 f"Design {first_num} — {rule_name}",
-                f"ports dropped (no observed traffic): {', '.join(dropped)}",
+                f"ports dropped from main rule: {', '.join(dropped)}",
             ))
         if known_exists and main_apps:
             if args.update_existing:
