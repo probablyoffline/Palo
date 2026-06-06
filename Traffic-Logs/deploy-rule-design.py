@@ -49,10 +49,10 @@ import ops_lib  # noqa: E402
 
 requests.packages.urllib3.disable_warnings()
 
-__version__ = "1.2.3"
+__version__ = "1.2.4"
 
 # Matches design-rule-apps.py — ranges wider than this are not expanded for port lookup
-MAX_RANGE_EXPAND = 100
+MAX_RANGE_EXPAND = 1000
 
 SEP  = "=" * 62
 DASH = "-" * 62
@@ -105,33 +105,39 @@ def fetch_existing_rule_names() -> set[str]:
 
 # ── DG hierarchy helpers ──────────────────────────────────────────────────────
 
-def fetch_dg_parent(dg_name: str) -> str | None:
-    """Return the parent DG name for dg_name, or None if top-level or on error."""
-    xpath = (
-        f"/config/devices/entry[@name='localhost.localdomain']"
-        f"/device-group/entry[@name='{dg_name}']/parent-dg"
-    )
+def fetch_dg_ancestors(dg_name: str) -> list[str]:
+    """Return ancestor DG names ordered root → leaf (not including dg_name itself).
+
+    Fetches all device groups in one API call and builds a child→parent map from
+    <parent-dg> elements. Returns [] gracefully if the hierarchy is flat or unavailable.
+    """
+    xpath = "/config/devices/entry[@name='localhost.localdomain']/device-group"
     try:
         xml_text = ops_lib.api_get(xpath)
         root     = ET.fromstring(xml_text)
-        text     = root.findtext(".//parent-dg") or root.findtext("result/parent-dg")
-        return text.strip() if text and text.strip() else None
     except Exception:
-        return None
+        return []
+    if root.get("status") == "error":
+        return []
 
+    parent_of: dict[str, str] = {}
+    for entry in root.iter("entry"):
+        name   = entry.get("name", "")
+        parent = entry.findtext("parent-dg")
+        if name and parent and parent.strip():
+            parent_of[name] = parent.strip()
 
-def fetch_dg_ancestors(dg_name: str) -> list[str]:
-    """Return ancestor DG names ordered root → leaf (not including dg_name itself)."""
     ancestors: list[str] = []
     visited   = {dg_name}
     current   = dg_name
-    while True:
-        parent = fetch_dg_parent(current)
-        if not parent or parent in visited:
+    while current in parent_of:
+        p = parent_of[current]
+        if p in visited:
             break
-        visited.add(parent)
-        ancestors.append(parent)
-        current = parent
+        visited.add(p)
+        ancestors.append(p)
+        current = p
+
     ancestors.reverse()
     return ancestors
 
