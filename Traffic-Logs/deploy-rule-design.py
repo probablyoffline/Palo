@@ -49,7 +49,7 @@ import ops_lib  # noqa: E402
 
 requests.packages.urllib3.disable_warnings()
 
-__version__ = "1.2.1"
+__version__ = "1.2.2"
 
 # Matches design-rule-apps.py — ranges wider than this are not expanded for port lookup
 MAX_RANGE_EXPAND = 100
@@ -521,6 +521,9 @@ def build_results_file(
 
 def apply_changes(staged: list[StagedChange]) -> list[dict]:
     results: list[dict] = []
+    total = sum(1 for s in staged if s.status == READY)
+    w     = len(str(total))
+    idx   = 0
 
     for sc in staged:
         row      = sc.row
@@ -534,37 +537,46 @@ def apply_changes(staged: list[StagedChange]) -> list[dict]:
             })
             continue
 
+        idx += 1
+        print(f"  [{idx:>{w}}/{total}]  {row_type:<12}  {rule}")
+
         try:
             if row_type == "new_rule":
                 xml_elem   = build_rule_xml(row, sc.resolved_svcs)
                 rule_xpath = ops_lib.rules_xpath()
 
+                print("             creating ...  ", end="", flush=True)
                 resp = ops_lib.api_set(rule_xpath, xml_elem)
                 if not ops_lib.is_success(resp):
                     try:
                         err = ET.fromstring(resp).findtext(".//msg") or resp[:160]
                     except Exception:
                         err = resp[:160]
+                    print(f"FAILED — {err}")
                     results.append({
                         "index": sc.index, "rule": rule, "type": row_type,
                         "outcome": "FAILED", "detail": f"SET failed: {err}",
                     })
                     continue
+                print("ok")
 
                 clone_above = row.get("clone_above", "").strip()
                 if clone_above:
+                    print(f"             moving above '{clone_above}' ...  ", end="", flush=True)
                     resp = api_move(rule, clone_above)
                     if not ops_lib.is_success(resp):
                         try:
                             err = ET.fromstring(resp).findtext(".//msg") or resp[:160]
                         except Exception:
                             err = resp[:160]
+                        print(f"FAILED — {err}")
                         results.append({
                             "index": sc.index, "rule": rule, "type": row_type,
                             "outcome": "FAILED",
                             "detail": f"rule created but MOVE failed: {err}",
                         })
                         continue
+                    print("ok")
 
                 results.append({
                     "index": sc.index, "rule": rule, "type": row_type,
@@ -577,18 +589,21 @@ def apply_changes(staged: list[StagedChange]) -> list[dict]:
                 tag_xpath  = f"{ops_lib.rules_xpath()}/entry[@name='{rule}']/tag"
                 failed_tags: list[str] = []
 
+                print(f"             adding {len(tags)} tag(s) ...  ", end="", flush=True)
                 for tag in tags:
                     resp = ops_lib.api_set(tag_xpath, f"<member>{_esc(tag)}</member>")
                     if not ops_lib.is_success(resp):
                         failed_tags.append(tag)
 
                 if failed_tags:
+                    print(f"FAILED ({len(failed_tags)} tag(s))")
                     results.append({
                         "index": sc.index, "rule": rule, "type": row_type,
                         "outcome": "FAILED",
                         "detail": f"failed to add: {', '.join(failed_tags)}",
                     })
                 else:
+                    print("ok")
                     results.append({
                         "index": sc.index, "rule": rule, "type": row_type,
                         "outcome": "APPLIED",
@@ -600,18 +615,21 @@ def apply_changes(staged: list[StagedChange]) -> list[dict]:
                 app_xpath = f"{ops_lib.rules_xpath()}/entry[@name='{rule}']/application"
                 failed_apps: list[str] = []
 
+                print(f"             adding {len(apps)} app(s) ...  ", end="", flush=True)
                 for app in apps:
                     resp = ops_lib.api_set(app_xpath, f"<member>{_esc(app)}</member>")
                     if not ops_lib.is_success(resp):
                         failed_apps.append(app)
 
                 if failed_apps:
+                    print(f"FAILED ({len(failed_apps)} app(s))")
                     results.append({
                         "index": sc.index, "rule": rule, "type": row_type,
                         "outcome": "FAILED",
                         "detail": f"failed to add: {', '.join(failed_apps)}",
                     })
                 else:
+                    print("ok")
                     results.append({
                         "index": sc.index, "rule": rule, "type": row_type,
                         "outcome": "APPLIED",
@@ -619,6 +637,7 @@ def apply_changes(staged: list[StagedChange]) -> list[dict]:
                     })
 
         except Exception as exc:
+            print("FAILED (exception)")
             results.append({
                 "index": sc.index, "rule": rule, "type": row_type,
                 "outcome": "FAILED", "detail": str(exc),
