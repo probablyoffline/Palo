@@ -49,7 +49,7 @@ import ops_lib  # noqa: E402
 
 requests.packages.urllib3.disable_warnings()
 
-__version__ = "1.2.4"
+__version__ = "1.2.5"
 
 # Matches design-rule-apps.py — ranges wider than this are not expanded for port lookup
 MAX_RANGE_EXPAND = 1000
@@ -103,45 +103,6 @@ def fetch_existing_rule_names() -> set[str]:
     return {e.get("name", "") for e in root.iter("entry") if e.get("name")}
 
 
-# ── DG hierarchy helpers ──────────────────────────────────────────────────────
-
-def fetch_dg_ancestors(dg_name: str) -> list[str]:
-    """Return ancestor DG names ordered root → leaf (not including dg_name itself).
-
-    Fetches all device groups in one API call and builds a child→parent map from
-    <parent-dg> elements. Returns [] gracefully if the hierarchy is flat or unavailable.
-    """
-    xpath = "/config/devices/entry[@name='localhost.localdomain']/device-group"
-    try:
-        xml_text = ops_lib.api_get(xpath)
-        root     = ET.fromstring(xml_text)
-    except Exception:
-        return []
-    if root.get("status") == "error":
-        return []
-
-    parent_of: dict[str, str] = {}
-    for entry in root.iter("entry"):
-        name   = entry.get("name", "")
-        parent = entry.findtext("parent-dg")
-        if name and parent and parent.strip():
-            parent_of[name] = parent.strip()
-
-    ancestors: list[str] = []
-    visited   = {dg_name}
-    current   = dg_name
-    while current in parent_of:
-        p = parent_of[current]
-        if p in visited:
-            break
-        visited.add(p)
-        ancestors.append(p)
-        current = p
-
-    ancestors.reverse()
-    return ancestors
-
-
 # ── Service object lookup ─────────────────────────────────────────────────────
 
 def _expand_port_spec(proto: str, port_spec: str) -> set[str]:
@@ -171,16 +132,20 @@ def _expand_port_spec(proto: str, port_spec: str) -> set[str]:
     return result
 
 
-def fetch_service_objects(ancestor_dgs: list[str] | None = None) -> dict[str, str]:
+def fetch_service_objects() -> dict[str, str]:
     """
     Return a mapping of 'proto-port' string → service object name.
 
     Queries (in order of increasing priority — later sources override earlier):
-      1. /config/predefined/service        — built-ins (service-http, service-https, …)
-      2. /config/shared/service            — shared custom objects  (Panorama)
-         /config/…/vsys/…/service          — vsys objects           (firewall)
-      3. ancestor DG service objects       — root → leaf order      (Panorama only)
-      4. /config/…/device-group/…/service  — target DG objects      (Panorama only)
+      1. /config/predefined/service              — built-ins
+      2. /config/shared/service                  — shared objects        (Panorama)
+         /config/…/vsys/…/service                — vsys objects          (firewall)
+      3. /config/…/device-group/entry/service    — all DG objects        (Panorama only)
+      4. /config/…/device-group/…/service        — target DG objects     (Panorama only)
+
+    Step 3 uses a wildcard (no DG name filter) so objects from all ancestor and sibling
+    DGs are found without needing to traverse the DG hierarchy. Step 4 ensures the target
+    DG always wins on any port conflict.
 
     When multiple objects cover the same port at the same priority level,
     the alphabetically-first name wins.
@@ -190,11 +155,10 @@ def fetch_service_objects(ancestor_dgs: list[str] | None = None) -> dict[str, st
     sources: list[str] = ["/config/predefined/service"]
     if ops_lib.MODE == "panorama":
         sources.append("/config/shared/service")
-        for anc in (ancestor_dgs or []):
-            sources.append(
-                f"/config/devices/entry[@name='localhost.localdomain']"
-                f"/device-group/entry[@name='{anc}']/service"
-            )
+        sources.append(
+            "/config/devices/entry[@name='localhost.localdomain']"
+            "/device-group/entry/service"
+        )
         sources.append(
             f"/config/devices/entry[@name='localhost.localdomain']"
             f"/device-group/entry[@name='{ops_lib.DEVICE_GROUP}']/service"
@@ -755,12 +719,9 @@ def main() -> None:
     existing_rules = fetch_existing_rule_names()
     print(f"{len(existing_rules)} rules found")
 
-    ancestor_dgs = fetch_dg_ancestors(ops_lib.DEVICE_GROUP) if ops_lib.MODE == "panorama" else []
-
     print("  Fetching service objects   ...", end=" ", flush=True)
-    port_to_svc = fetch_service_objects(ancestor_dgs)
-    ancestor_note = f"  (ancestors: {', '.join(ancestor_dgs)})" if ancestor_dgs else ""
-    print(f"{len(port_to_svc)} port-to-service mappings found{ancestor_note}")
+    port_to_svc = fetch_service_objects()
+    print(f"{len(port_to_svc)} port-to-service mappings found")
     print()
 
     # ── Stage ─────────────────────────────────────────────────────────────────
