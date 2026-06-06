@@ -49,7 +49,7 @@ import ops_lib  # noqa: E402
 
 requests.packages.urllib3.disable_warnings()
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 # Matches design-rule-apps.py — ranges wider than this are not expanded for port lookup
 MAX_RANGE_EXPAND = 100
@@ -537,7 +537,7 @@ def apply_changes(staged: list[StagedChange]) -> list[dict]:
         try:
             if row_type == "new_rule":
                 xml_elem   = build_rule_xml(row, sc.resolved_svcs)
-                rule_xpath = f"{ops_lib.rules_xpath()}/entry[@name='{rule}']"
+                rule_xpath = ops_lib.rules_xpath()
 
                 resp = ops_lib.api_set(rule_xpath, xml_elem)
                 if not ops_lib.is_success(resp):
