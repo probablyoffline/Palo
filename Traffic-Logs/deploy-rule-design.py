@@ -1,0 +1,787 @@
+"""
+deploy-rule-design.py — Stage and apply rule design changes to Panorama/firewall
+
+Reads the design CSV produced by design-rule-apps.py (or any compatible design
+file), validates each change against the live config, writes a staging file for
+review, then waits for confirmation before applying.
+
+Execution flow:
+  1. Load design CSV
+  2. Fetch existing rule names from config (one API call)
+  3. Fetch service objects from predefined / shared / DG sources
+  4. Classify each change: READY / SKIP / BLOCKED
+  5. Write staging file
+  6. Print summary + prompt Enter to apply (or Ctrl+C to abort)
+  7. Apply all READY changes in CSV order
+  8. Write results file
+
+Row types handled:
+  new_rule   — create a new security rule, then move it above clone_above
+  tag_update — add tags from tags_to_add to an existing rule
+
+Service resolution:
+  service = "application-default" or "any" → used directly
+  service = "tcp-443 | tcp-8080"           → resolved to service object names
+  If any port in an explicit service string has no matching service object,
+  the change is BLOCKED and listed in the staging warnings.
+
+Usage:
+    python deploy-rule-design.py <input_csv> [options]
+
+Options:
+    --device-group NAME / --dg NAME   Override device group (Panorama mode only)
+    --output PATH / -o PATH           Output file stem (auto-named if omitted)
+    --dry-run                         Write staging file only; skip apply prompt
+"""
+
+import argparse
+import csv
+import datetime
+import sys
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import requests
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "libs"))
+import ops_lib  # noqa: E402
+
+requests.packages.urllib3.disable_warnings()
+
+__version__ = "1.2.0"
+
+# Matches design-rule-apps.py — ranges wider than this are not expanded for port lookup
+MAX_RANGE_EXPAND = 100
+
+SEP  = "=" * 62
+DASH = "-" * 62
+
+READY   = "READY"
+SKIP    = "SKIP"
+BLOCKED = "BLOCKED"
+
+
+# ── API helpers ───────────────────────────────────────────────────────────────
+
+def _post(params: dict) -> str:
+    r = requests.post(
+        f"https://{ops_lib.TARGET_HOST}/api/",
+        data=params,
+        verify=False,
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.text
+
+
+def api_move(rule_name: str, before_rule: str) -> str:
+    """Move a security rule to sit immediately before another rule."""
+    xpath = f"{ops_lib.rules_xpath()}/entry[@name='{rule_name}']"
+    return _post({
+        "type":   "config",
+        "action": "move",
+        "xpath":  xpath,
+        "where":  "before",
+        "dst":    before_rule,
+        "key":    ops_lib.API_KEY,
+    })
+
+
+# ── Existing rule lookup ──────────────────────────────────────────────────────
+
+def fetch_existing_rule_names() -> set[str]:
+    """Return the set of all security rule names currently in the rulebase."""
+    try:
+        xml_text = ops_lib.api_get(ops_lib.rules_xpath())
+        root     = ET.fromstring(xml_text)
+    except Exception as exc:
+        print(f"  Warning: could not fetch existing rules: {exc}")
+        return set()
+    if root.get("status") == "error":
+        return set()
+    return {e.get("name", "") for e in root.iter("entry") if e.get("name")}
+
+
+# ── Service object lookup ─────────────────────────────────────────────────────
+
+def _expand_port_spec(proto: str, port_spec: str) -> set[str]:
+    """
+    Parse a PAN-OS port spec (e.g. '80,443' or '8080-8090') into a set of
+    'proto-port' strings.  Ranges wider than MAX_RANGE_EXPAND are skipped.
+    """
+    result: set[str] = set()
+    for part in port_spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            try:
+                lo, hi = (int(x) for x in part.split("-", 1))
+                if hi - lo <= MAX_RANGE_EXPAND:
+                    for p in range(lo, hi + 1):
+                        result.add(f"{proto}-{p}")
+            except ValueError:
+                pass
+        else:
+            try:
+                int(part)
+                result.add(f"{proto}-{part}")
+            except ValueError:
+                pass
+    return result
+
+
+def fetch_service_objects() -> dict[str, str]:
+    """
+    Return a mapping of 'proto-port' string → service object name.
+
+    Queries (in order of increasing priority — later sources override earlier):
+      1. /config/predefined/service      — built-ins (service-http, service-https, …)
+      2. /config/shared/service          — shared custom objects  (Panorama)
+         /config/…/vsys/…/service        — vsys objects           (firewall)
+      3. /config/…/device-group/…/service — DG-specific objects   (Panorama only)
+
+    When multiple objects cover the same port at the same priority level,
+    the alphabetically-first name wins.
+    """
+    port_to_name: dict[str, str] = {}
+
+    sources: list[str] = ["/config/predefined/service"]
+    if ops_lib.MODE == "panorama":
+        sources.append("/config/shared/service")
+        sources.append(
+            f"/config/devices/entry[@name='localhost.localdomain']"
+            f"/device-group/entry[@name='{ops_lib.DEVICE_GROUP}']/service"
+        )
+    else:
+        sources.append(
+            f"/config/devices/entry[@name='localhost.localdomain']"
+            f"/vsys/entry[@name='{ops_lib.VSYS}']/service"
+        )
+
+    for xpath in sources:
+        try:
+            xml_text = ops_lib.api_get(xpath)
+            root     = ET.fromstring(xml_text)
+        except Exception:
+            continue
+        if root.get("status") == "error":
+            continue
+
+        # Sort alphabetically so the first name wins when ports overlap
+        for entry in sorted(root.iter("entry"), key=lambda e: e.get("name", "")):
+            name = entry.get("name", "")
+            if not name:
+                continue
+            tcp_el = entry.find(".//protocol/tcp/port")
+            if tcp_el is not None and tcp_el.text:
+                for key in _expand_port_spec("tcp", tcp_el.text):
+                    port_to_name[key] = name
+            udp_el = entry.find(".//protocol/udp/port")
+            if udp_el is not None and udp_el.text:
+                for key in _expand_port_spec("udp", udp_el.text):
+                    port_to_name[key] = name
+
+    return port_to_name
+
+
+def resolve_service(
+    service_raw: str,
+    port_to_svc: dict[str, str],
+) -> tuple[list[str], list[str]]:
+    """
+    Resolve a service string from the design CSV to service object names.
+
+    Returns (resolved, unresolved):
+      resolved   — service object names to use in the rule (deduplicated, ordered)
+      unresolved — 'proto-port' strings that have no matching service object
+    """
+    s = service_raw.strip()
+    if not s or s.lower() in ("application-default", "any"):
+        return [s or "application-default"], []
+
+    resolved:   list[str] = []
+    unresolved: list[str] = []
+    seen: set[str] = set()
+
+    for port_str in (p.strip() for p in s.split("|") if p.strip()):
+        key = port_str.lower()
+        if key in port_to_svc:
+            svc = port_to_svc[key]
+            if svc not in seen:
+                seen.add(svc)
+                resolved.append(svc)
+        else:
+            unresolved.append(port_str)
+
+    return resolved, unresolved
+
+
+# ── XML builder ───────────────────────────────────────────────────────────────
+
+def _esc(s: str) -> str:
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _members(items: list[str]) -> str:
+    return "".join(f"<member>{_esc(m)}</member>" for m in items)
+
+
+def _split_pipe(s: str) -> list[str]:
+    return [x.strip() for x in s.split("|") if x.strip()] if s.strip() else []
+
+
+def build_rule_xml(row: dict, resolved_services: list[str]) -> str:
+    """Return the full <entry name="…">…</entry> XML string for a new_rule row."""
+    name       = row["rule_name"]
+    src_zones  = _split_pipe(row.get("source_zones", ""))
+    dst_zones  = _split_pipe(row.get("dest_zones", ""))
+    src_addrs  = _split_pipe(row.get("source_addresses", "")) or ["any"]
+    dst_addrs  = _split_pipe(row.get("dest_addresses", "")) or ["any"]
+    src_users  = _split_pipe(row.get("source_user", "")) or ["any"]
+    apps       = _split_pipe(row.get("applications", "")) or ["any"]
+    tags       = _split_pipe(row.get("tags", ""))
+    action     = (row.get("action") or "allow").strip()
+    desc       = (row.get("description") or "").strip()
+    profile    = (row.get("group_profile") or "").strip()
+
+    parts = [f'<entry name="{_esc(name)}">']
+    parts.append(f"<from>{_members(src_zones)}</from>")
+    parts.append(f"<to>{_members(dst_zones)}</to>")
+    parts.append(f"<source>{_members(src_addrs)}</source>")
+    parts.append(f"<destination>{_members(dst_addrs)}</destination>")
+    parts.append(f"<source-user>{_members(src_users)}</source-user>")
+    parts.append(f"<application>{_members(apps)}</application>")
+    parts.append(f"<service>{_members(resolved_services)}</service>")
+    parts.append(f"<action>{_esc(action)}</action>")
+    if desc:
+        parts.append(f"<description>{_esc(desc)}</description>")
+    if tags:
+        parts.append(f"<tag>{_members(tags)}</tag>")
+    if profile:
+        parts.append(
+            f"<profile-setting>"
+            f"<group><member>{_esc(profile)}</member></group>"
+            f"</profile-setting>"
+        )
+    parts.append("</entry>")
+    return "".join(parts)
+
+
+# ── Staging data model ────────────────────────────────────────────────────────
+
+@dataclass
+class StagedChange:
+    index:         int
+    row:           dict
+    status:        str           # READY / SKIP / BLOCKED
+    reason:        str = ""
+    resolved_svcs: list[str] = field(default_factory=list)
+
+
+# ── Staging logic ─────────────────────────────────────────────────────────────
+
+def stage_changes(
+    rows:           list[dict],
+    existing_rules: set[str],
+    port_to_svc:    dict[str, str],
+) -> list[StagedChange]:
+    staged: list[StagedChange] = []
+
+    for i, row in enumerate(rows, start=1):
+        row_type  = (row.get("type") or "").strip()
+        rule_name = (row.get("rule_name") or "").strip()
+
+        if not row_type or not rule_name:
+            continue
+
+        if row_type == "new_rule":
+            clone_above = (row.get("clone_above") or "").strip()
+
+            if rule_name in existing_rules:
+                staged.append(StagedChange(i, row, SKIP,
+                    f"rule '{rule_name}' already exists — skipping"))
+                continue
+
+            if clone_above and clone_above not in existing_rules:
+                staged.append(StagedChange(i, row, BLOCKED,
+                    f"clone_above rule '{clone_above}' not found in config"))
+                continue
+
+            service_raw = (row.get("service") or "application-default").strip()
+            resolved, unresolved = resolve_service(service_raw, port_to_svc)
+            if unresolved:
+                staged.append(StagedChange(i, row, BLOCKED,
+                    f"no service object found for: {', '.join(unresolved)}"))
+                continue
+
+            staged.append(StagedChange(i, row, READY, resolved_svcs=resolved))
+
+        elif row_type == "tag_update":
+            if rule_name not in existing_rules:
+                staged.append(StagedChange(i, row, BLOCKED,
+                    f"rule '{rule_name}' not found in config"))
+                continue
+            staged.append(StagedChange(i, row, READY))
+
+        elif row_type == "app_update":
+            apps = _split_pipe(row.get("applications", ""))
+            if rule_name not in existing_rules:
+                staged.append(StagedChange(i, row, BLOCKED,
+                    f"rule '{rule_name}' not found in config"))
+                continue
+            if not apps:
+                staged.append(StagedChange(i, row, SKIP,
+                    "no applications listed — nothing to add"))
+                continue
+            staged.append(StagedChange(i, row, READY))
+
+        else:
+            staged.append(StagedChange(i, row, BLOCKED,
+                f"unknown row type '{row_type}'"))
+
+    return staged
+
+
+# ── Staging file builder ──────────────────────────────────────────────────────
+
+def _format_change_block(sc: StagedChange) -> list[str]:
+    row      = sc.row
+    row_type = row.get("type", "")
+    rule     = row.get("rule_name", "")
+    lines: list[str] = [f"Change {sc.index} — {sc.status} — {row_type}"]
+
+    if sc.status in (BLOCKED, SKIP):
+        lines.append(f"  Rule     : {rule}")
+        lines.append(f"  Reason   : {sc.reason}")
+        return lines
+
+    # READY — new_rule
+    if row_type == "new_rule":
+        def fmt(key: str, default: str = "(none)") -> str:
+            vals = _split_pipe(row.get(key, ""))
+            return ", ".join(vals) if vals else default
+
+        clone_above  = row.get("clone_above", "").strip()
+        svc_display  = ", ".join(sc.resolved_svcs) if sc.resolved_svcs else row.get("service", "")
+        rule_xpath   = f"{ops_lib.rules_xpath()}/entry[@name='{rule}']"
+
+        lines += [
+            f"  New rule : {rule}",
+            f"  Above    : {clone_above or '(none)'}",
+            f"  Apps     : {fmt('applications')}",
+            f"  Service  : {svc_display or '(none)'}",
+            f"  Action   : {row.get('action', 'allow').strip()}",
+            f"  Tags     : {fmt('tags')}",
+            f"  Src zones: {fmt('source_zones')}",
+            f"  Src addrs: {fmt('source_addresses', 'any')}",
+            f"  Src users: {fmt('source_user', 'any')}",
+            f"  Dst zones: {fmt('dest_zones')}",
+            f"  Dst addrs: {fmt('dest_addresses', 'any')}",
+        ]
+        if row.get("group_profile", "").strip():
+            lines.append(f"  Profile  : {row['group_profile'].strip()}")
+
+        lines += [
+            "",
+            f"  XPath    : {rule_xpath}",
+            f"  Ops      : SET (create rule)  →  MOVE before {clone_above}",
+        ]
+
+    # READY — tag_update
+    elif row_type == "tag_update":
+        tags_to_add = _split_pipe(row.get("tags_to_add", ""))
+        lines += [
+            f"  Rule     : {rule}",
+            f"  Add tags : {', '.join(tags_to_add) or '(none)'}",
+        ]
+        if tags_to_add:
+            lines.append("")
+            tag_xpath = f"{ops_lib.rules_xpath()}/entry[@name='{rule}']/tag"
+            for tag in tags_to_add:
+                lines.append(f"  XPath    : {tag_xpath}")
+                lines.append(f"  Ops      : SET <member>{tag}</member>")
+
+    # READY — app_update
+    elif row_type == "app_update":
+        apps = _split_pipe(row.get("applications", ""))
+        lines += [
+            f"  Rule     : {rule}",
+            f"  Add apps : {', '.join(apps) or '(none)'}",
+        ]
+        if apps:
+            lines.append("")
+            app_xpath = f"{ops_lib.rules_xpath()}/entry[@name='{rule}']/application"
+            for app in apps:
+                lines.append(f"  XPath    : {app_xpath}")
+                lines.append(f"  Ops      : SET <member>{app}</member>")
+
+    return lines
+
+
+def build_staging_file(
+    staged:     list[StagedChange],
+    input_path: str,
+    run_dt:     datetime.datetime,
+) -> str:
+    ready_count   = sum(1 for s in staged if s.status == READY)
+    skip_count    = sum(1 for s in staged if s.status == SKIP)
+    blocked_count = sum(1 for s in staged if s.status == BLOCKED)
+    new_count        = sum(1 for s in staged if s.row.get("type") == "new_rule")
+    tag_count        = sum(1 for s in staged if s.row.get("type") == "tag_update")
+    app_update_count = sum(1 for s in staged if s.row.get("type") == "app_update")
+
+    lines: list[str] = []
+
+    lines += [
+        "STAGING PLAN",
+        SEP,
+        f"Generated  : {run_dt.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"Script     : deploy-rule-design.py v{__version__}",
+        f"Input      : {input_path}",
+        f"Target     : {ops_lib.TARGET_HOST}  ({ops_lib.mode_summary()})",
+        f"Changes    : {len(staged)} total — {new_count} new rule(s), {tag_count} tag update(s), {app_update_count} app update(s)",
+        "",
+    ]
+
+    warnings = [s for s in staged if s.status in (BLOCKED, SKIP)]
+    if warnings:
+        lines += ["WARNINGS", SEP]
+        idx_pad  = max(len(str(s.index))             for s in staged)
+        type_pad = max(len(s.row.get("type", ""))    for s in staged)
+        name_pad = max(len(s.row.get("rule_name", "")) for s in staged)
+        for s in warnings:
+            idx  = str(s.index).rjust(idx_pad)
+            typ  = s.row.get("type", "").ljust(type_pad)
+            name = s.row.get("rule_name", "").ljust(name_pad)
+            lines.append(f"  Change {idx}  {typ}  {name}  :  {s.reason}")
+        lines.append(DASH)
+
+    lines += [
+        f"  READY    : {ready_count:>4}",
+        f"  BLOCKED  : {blocked_count:>4}",
+        f"  SKIP     : {skip_count:>4}",
+    ]
+    if blocked_count or skip_count:
+        lines.append("Blocked / skipped changes will not be applied.")
+
+    lines += ["", "CHANGES", SEP]
+
+    for sc in staged:
+        lines.append("")
+        lines.extend(_format_change_block(sc))
+        lines += ["", DASH]
+
+    return "\n".join(lines)
+
+
+# ── Results file builder ──────────────────────────────────────────────────────
+
+def build_results_file(
+    results:    list[dict],
+    input_path: str,
+    run_dt:     datetime.datetime,
+    apply_dt:   datetime.datetime,
+) -> str:
+    applied = sum(1 for r in results if r["outcome"] == "APPLIED")
+    failed  = sum(1 for r in results if r["outcome"] == "FAILED")
+    skipped = sum(1 for r in results if r["outcome"] == "SKIPPED")
+
+    lines: list[str] = [
+        "APPLY RESULTS",
+        SEP,
+        f"Staged     : {run_dt.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"Applied    : {apply_dt.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"Script     : deploy-rule-design.py v{__version__}",
+        f"Input      : {input_path}",
+        f"Target     : {ops_lib.TARGET_HOST}  ({ops_lib.mode_summary()})",
+        "",
+        SEP,
+        f"  APPLIED  : {applied:>4}",
+        f"  FAILED   : {failed:>4}",
+        f"  SKIPPED  : {skipped:>4}",
+        SEP,
+        "",
+        "DETAILS",
+        SEP,
+    ]
+
+    for r in results:
+        pad = r["outcome"].ljust(8)
+        lines.append(f"  {pad}  [{r['type']}]  {r['rule']}")
+        if r.get("detail"):
+            lines.append(f"              └─ {r['detail']}")
+
+    lines += ["", SEP]
+    return "\n".join(lines)
+
+
+# ── Apply ─────────────────────────────────────────────────────────────────────
+
+def apply_changes(staged: list[StagedChange]) -> list[dict]:
+    results: list[dict] = []
+
+    for sc in staged:
+        row      = sc.row
+        row_type = row.get("type", "")
+        rule     = row.get("rule_name", "")
+
+        if sc.status != READY:
+            results.append({
+                "index": sc.index, "rule": rule, "type": row_type,
+                "outcome": "SKIPPED", "detail": sc.reason,
+            })
+            continue
+
+        try:
+            if row_type == "new_rule":
+                xml_elem   = build_rule_xml(row, sc.resolved_svcs)
+                rule_xpath = f"{ops_lib.rules_xpath()}/entry[@name='{rule}']"
+
+                resp = ops_lib.api_set(rule_xpath, xml_elem)
+                if not ops_lib.is_success(resp):
+                    try:
+                        err = ET.fromstring(resp).findtext(".//msg") or resp[:160]
+                    except Exception:
+                        err = resp[:160]
+                    results.append({
+                        "index": sc.index, "rule": rule, "type": row_type,
+                        "outcome": "FAILED", "detail": f"SET failed: {err}",
+                    })
+                    continue
+
+                clone_above = row.get("clone_above", "").strip()
+                if clone_above:
+                    resp = api_move(rule, clone_above)
+                    if not ops_lib.is_success(resp):
+                        try:
+                            err = ET.fromstring(resp).findtext(".//msg") or resp[:160]
+                        except Exception:
+                            err = resp[:160]
+                        results.append({
+                            "index": sc.index, "rule": rule, "type": row_type,
+                            "outcome": "FAILED",
+                            "detail": f"rule created but MOVE failed: {err}",
+                        })
+                        continue
+
+                results.append({
+                    "index": sc.index, "rule": rule, "type": row_type,
+                    "outcome": "APPLIED",
+                    "detail": f"created and moved above '{clone_above}'" if clone_above else "created",
+                })
+
+            elif row_type == "tag_update":
+                tags       = _split_pipe(row.get("tags_to_add", ""))
+                tag_xpath  = f"{ops_lib.rules_xpath()}/entry[@name='{rule}']/tag"
+                failed_tags: list[str] = []
+
+                for tag in tags:
+                    resp = ops_lib.api_set(tag_xpath, f"<member>{_esc(tag)}</member>")
+                    if not ops_lib.is_success(resp):
+                        failed_tags.append(tag)
+
+                if failed_tags:
+                    results.append({
+                        "index": sc.index, "rule": rule, "type": row_type,
+                        "outcome": "FAILED",
+                        "detail": f"failed to add: {', '.join(failed_tags)}",
+                    })
+                else:
+                    results.append({
+                        "index": sc.index, "rule": rule, "type": row_type,
+                        "outcome": "APPLIED",
+                        "detail": f"added {len(tags)} tag(s): {', '.join(tags)}",
+                    })
+
+            elif row_type == "app_update":
+                apps      = _split_pipe(row.get("applications", ""))
+                app_xpath = f"{ops_lib.rules_xpath()}/entry[@name='{rule}']/application"
+                failed_apps: list[str] = []
+
+                for app in apps:
+                    resp = ops_lib.api_set(app_xpath, f"<member>{_esc(app)}</member>")
+                    if not ops_lib.is_success(resp):
+                        failed_apps.append(app)
+
+                if failed_apps:
+                    results.append({
+                        "index": sc.index, "rule": rule, "type": row_type,
+                        "outcome": "FAILED",
+                        "detail": f"failed to add: {', '.join(failed_apps)}",
+                    })
+                else:
+                    results.append({
+                        "index": sc.index, "rule": rule, "type": row_type,
+                        "outcome": "APPLIED",
+                        "detail": f"added {len(apps)} app(s): {', '.join(apps)}",
+                    })
+
+        except Exception as exc:
+            results.append({
+                "index": sc.index, "rule": rule, "type": row_type,
+                "outcome": "FAILED", "detail": str(exc),
+            })
+
+    return results
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Stage and apply rule design changes from design-rule-apps.py CSV output."
+    )
+    parser.add_argument("input_csv", help="Design CSV produced by design-rule-apps.py")
+    parser.add_argument(
+        "--device-group", "--dg", metavar="NAME", dest="device_group",
+        help="Override device group (Panorama mode only)",
+    )
+    parser.add_argument(
+        "--output", "-o", metavar="PATH",
+        help="Output file stem (default: Output/deploy-{input_stem}-{TIMESTAMP})",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Write staging file only; skip the confirmation prompt and apply step",
+    )
+    args = parser.parse_args()
+
+    if args.device_group:
+        ops_lib.DEVICE_GROUP = args.device_group
+        ops_lib.MODE = "panorama"
+
+    run_dt      = datetime.datetime.now()
+    timestamp   = run_dt.strftime("%Y%m%d-%H%M%S")
+    input_path  = args.input_csv
+    input_stem  = Path(input_path).stem
+    output_stem = args.output or f"Output/deploy-{input_stem}-{timestamp}"
+    Path(output_stem).parent.mkdir(parents=True, exist_ok=True)
+
+    staging_path = f"{output_stem}-staging.txt"
+    results_path = f"{output_stem}-results.txt"
+
+    print(SEP)
+    print(f"  deploy-rule-design  v{__version__}")
+    print(SEP)
+    print(f"  Input      : {input_path}")
+    print(f"  Target     : {ops_lib.TARGET_HOST}  ({ops_lib.mode_summary()})")
+    if args.dry_run:
+        print("  Mode       : dry-run (staging only — no changes will be applied)")
+    print(f"  Staging    : {staging_path}")
+    if not args.dry_run:
+        print(f"  Results    : {results_path}")
+    print()
+
+    # ── Load CSV ──────────────────────────────────────────────────────────────
+    try:
+        with open(input_path, newline="", encoding="utf-8") as fh:
+            rows = list(csv.DictReader(fh))
+    except FileNotFoundError:
+        print(f"Error: input file not found: {input_path}", file=sys.stderr)
+        sys.exit(1)
+
+    if not rows:
+        print("No rows found in input CSV.", file=sys.stderr)
+        sys.exit(1)
+
+    # ── Fetch live config data ────────────────────────────────────────────────
+    print("  Fetching existing rule names ...", end=" ", flush=True)
+    existing_rules = fetch_existing_rule_names()
+    print(f"{len(existing_rules)} rules found")
+
+    print("  Fetching service objects   ...", end=" ", flush=True)
+    port_to_svc = fetch_service_objects()
+    print(f"{len(port_to_svc)} port-to-service mappings found")
+    print()
+
+    # ── Stage ─────────────────────────────────────────────────────────────────
+    staged = stage_changes(rows, existing_rules, port_to_svc)
+
+    ready_count   = sum(1 for s in staged if s.status == READY)
+    skip_count    = sum(1 for s in staged if s.status == SKIP)
+    blocked_count = sum(1 for s in staged if s.status == BLOCKED)
+
+    # ── Write staging file ────────────────────────────────────────────────────
+    staging_text = build_staging_file(staged, input_path, run_dt)
+    with open(staging_path, "w", encoding="utf-8") as fh:
+        fh.write(staging_text + "\n")
+
+    # ── Print summary ─────────────────────────────────────────────────────────
+    print(SEP)
+    print("  STAGING SUMMARY")
+    print(DASH)
+    print(f"  READY    : {ready_count}")
+    print(f"  BLOCKED  : {blocked_count}")
+    print(f"  SKIP     : {skip_count}")
+    print(SEP)
+
+    blocked_items = [s for s in staged if s.status == BLOCKED]
+    if blocked_items:
+        print()
+        print("  Blocked changes (will not be applied):")
+        for s in blocked_items:
+            print(f"    Change {s.index:>3}  {s.row.get('rule_name', '')}  —  {s.reason}")
+
+    print(f"\n  Staging file : {staging_path}\n")
+
+    if args.dry_run:
+        print("  Dry-run — exiting without applying.")
+        print(SEP)
+        return
+
+    if ready_count == 0:
+        print("  No READY changes to apply.")
+        print(SEP)
+        return
+
+    # ── Confirm ───────────────────────────────────────────────────────────────
+    try:
+        input(
+            f"  Review the staging file, then press Enter to apply "
+            f"{ready_count} change(s), or Ctrl+C to abort: "
+        )
+    except KeyboardInterrupt:
+        print("\n\n  Aborted — no changes applied.")
+        sys.exit(0)
+
+    # ── Apply ─────────────────────────────────────────────────────────────────
+    print()
+    print(SEP)
+    print("  Applying changes ...")
+    print(SEP)
+
+    apply_dt = datetime.datetime.now()
+    results  = apply_changes(staged)
+
+    applied_count = sum(1 for r in results if r["outcome"] == "APPLIED")
+    failed_count  = sum(1 for r in results if r["outcome"] == "FAILED")
+
+    for r in results:
+        if r["outcome"] in ("APPLIED", "FAILED"):
+            pad = r["outcome"].ljust(8)
+            print(f"  {pad}  {r['rule']}")
+            if r.get("detail"):
+                print(f"            └─ {r['detail']}")
+
+    # ── Write results file ────────────────────────────────────────────────────
+    results_text = build_results_file(results, input_path, run_dt, apply_dt)
+    with open(results_path, "w", encoding="utf-8") as fh:
+        fh.write(results_text + "\n")
+
+    # ── Final summary ─────────────────────────────────────────────────────────
+    print()
+    print(SEP)
+    print("  APPLY RESULTS")
+    print(DASH)
+    print(f"  Applied  : {applied_count}")
+    print(f"  Failed   : {failed_count}")
+    print(f"  Skipped  : {len(results) - applied_count - failed_count}")
+    print(DASH)
+    print(f"  Results  : {results_path}")
+    print(SEP)
+
+
+if __name__ == "__main__":
+    main()

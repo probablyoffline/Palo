@@ -1,0 +1,4 @@
+type,device_group,rule_name,clone_above,description,tags,source_zones,source_addresses,source_user,dest_zones,dest_addresses,applications,service,action,group_profile,tags_to_add
+new_rule,,APP-ID-Example-Allow,Example-Allow,,app-id-new-rule,Trust,any,any,Untrust,any,ssl | web-browsing,application-default,allow,Security-Profiles,
+tag_update,,Example-Allow,,,,,,,,,,,,,app-id-under-review
+app_update,,APP-ID-Example-Allow,,,,,,,,,,ms-office365,,,,
