@@ -49,7 +49,7 @@ import ops_lib  # noqa: E402
 
 requests.packages.urllib3.disable_warnings()
 
-__version__ = "1.2.2"
+__version__ = "1.2.3"
 
 # Matches design-rule-apps.py — ranges wider than this are not expanded for port lookup
 MAX_RANGE_EXPAND = 100
@@ -103,6 +103,39 @@ def fetch_existing_rule_names() -> set[str]:
     return {e.get("name", "") for e in root.iter("entry") if e.get("name")}
 
 
+# ── DG hierarchy helpers ──────────────────────────────────────────────────────
+
+def fetch_dg_parent(dg_name: str) -> str | None:
+    """Return the parent DG name for dg_name, or None if top-level or on error."""
+    xpath = (
+        f"/config/devices/entry[@name='localhost.localdomain']"
+        f"/device-group/entry[@name='{dg_name}']/parent-dg"
+    )
+    try:
+        xml_text = ops_lib.api_get(xpath)
+        root     = ET.fromstring(xml_text)
+        text     = root.findtext(".//parent-dg") or root.findtext("result/parent-dg")
+        return text.strip() if text and text.strip() else None
+    except Exception:
+        return None
+
+
+def fetch_dg_ancestors(dg_name: str) -> list[str]:
+    """Return ancestor DG names ordered root → leaf (not including dg_name itself)."""
+    ancestors: list[str] = []
+    visited   = {dg_name}
+    current   = dg_name
+    while True:
+        parent = fetch_dg_parent(current)
+        if not parent or parent in visited:
+            break
+        visited.add(parent)
+        ancestors.append(parent)
+        current = parent
+    ancestors.reverse()
+    return ancestors
+
+
 # ── Service object lookup ─────────────────────────────────────────────────────
 
 def _expand_port_spec(proto: str, port_spec: str) -> set[str]:
@@ -132,15 +165,16 @@ def _expand_port_spec(proto: str, port_spec: str) -> set[str]:
     return result
 
 
-def fetch_service_objects() -> dict[str, str]:
+def fetch_service_objects(ancestor_dgs: list[str] | None = None) -> dict[str, str]:
     """
     Return a mapping of 'proto-port' string → service object name.
 
     Queries (in order of increasing priority — later sources override earlier):
-      1. /config/predefined/service      — built-ins (service-http, service-https, …)
-      2. /config/shared/service          — shared custom objects  (Panorama)
-         /config/…/vsys/…/service        — vsys objects           (firewall)
-      3. /config/…/device-group/…/service — DG-specific objects   (Panorama only)
+      1. /config/predefined/service        — built-ins (service-http, service-https, …)
+      2. /config/shared/service            — shared custom objects  (Panorama)
+         /config/…/vsys/…/service          — vsys objects           (firewall)
+      3. ancestor DG service objects       — root → leaf order      (Panorama only)
+      4. /config/…/device-group/…/service  — target DG objects      (Panorama only)
 
     When multiple objects cover the same port at the same priority level,
     the alphabetically-first name wins.
@@ -150,6 +184,11 @@ def fetch_service_objects() -> dict[str, str]:
     sources: list[str] = ["/config/predefined/service"]
     if ops_lib.MODE == "panorama":
         sources.append("/config/shared/service")
+        for anc in (ancestor_dgs or []):
+            sources.append(
+                f"/config/devices/entry[@name='localhost.localdomain']"
+                f"/device-group/entry[@name='{anc}']/service"
+            )
         sources.append(
             f"/config/devices/entry[@name='localhost.localdomain']"
             f"/device-group/entry[@name='{ops_lib.DEVICE_GROUP}']/service"
@@ -710,9 +749,12 @@ def main() -> None:
     existing_rules = fetch_existing_rule_names()
     print(f"{len(existing_rules)} rules found")
 
+    ancestor_dgs = fetch_dg_ancestors(ops_lib.DEVICE_GROUP) if ops_lib.MODE == "panorama" else []
+
     print("  Fetching service objects   ...", end=" ", flush=True)
-    port_to_svc = fetch_service_objects()
-    print(f"{len(port_to_svc)} port-to-service mappings found")
+    port_to_svc = fetch_service_objects(ancestor_dgs)
+    ancestor_note = f"  (ancestors: {', '.join(ancestor_dgs)})" if ancestor_dgs else ""
+    print(f"{len(port_to_svc)} port-to-service mappings found{ancestor_note}")
     print()
 
     # ── Stage ─────────────────────────────────────────────────────────────────
