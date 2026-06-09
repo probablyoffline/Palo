@@ -81,6 +81,19 @@ Design logic:
   - All new rules get: app-id-new-rule
   - Old rules with new rules get: app-id-under-review
   - Old rules with no traffic get: app-id-review-unused
+
+NS rule service consolidation:
+  At startup the script fetches all service objects and service groups from Panorama
+  (predefined, shared, and all DGs via wildcard).  When building the NS rule's service
+  field, named service objects/groups from the original rule's configured service
+  members are checked against the observed non-standard ports:
+    - If a named object/group covers one or more observed ports, it is used directly
+      in the service field and those ports are removed from the individual list.
+    - Service groups are recursively expanded to their member objects.
+    - Port ranges are handled via range containment (no expansion limit).
+    - Any observed port not covered by a named object remains listed individually.
+  This replaces long per-port lists (tcp-27199 | tcp-27201 | …) with the compact
+  service object or group name that was already protecting those ports in the old rule.
 """
 
 import argparse
@@ -101,7 +114,7 @@ requests.packages.urllib3.disable_warnings()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-__version__ = "1.11.2"
+__version__ = "1.11.3"
 
 APP_REVIEW_THRESHOLD     = 10  # flag designs with this many or more usable apps
 APP_FETCH_BATCH          = 50  # max apps per XPath filter to avoid PAN-OS XPath length limits
@@ -457,6 +470,79 @@ def fetch_all_predefined_ports() -> dict[str, set[str]]:
 
 
 
+def fetch_service_port_map() -> dict[str, list[tuple[str, int, int]]]:
+    """Return {service_obj_name: [(proto, lo, hi), ...]} for all accessible service objects."""
+    name_to_ranges: dict[str, list[tuple[str, int, int]]] = {}
+    sources = ["/config/predefined/service", "/config/shared/service"]
+    if ops_lib.MODE == "panorama":
+        sources.append(
+            "/config/devices/entry[@name='localhost.localdomain']"
+            "/device-group/entry/service"
+        )
+    else:
+        sources.append(
+            f"/config/devices/entry[@name='localhost.localdomain']"
+            f"/vsys/entry[@name='{ops_lib.VSYS}']/service"
+        )
+    for xpath in sources:
+        try:
+            xml_text = ops_lib.api_get(xpath)
+            root     = ET.fromstring(xml_text)
+        except Exception:
+            continue
+        if root.get("status") == "error":
+            continue
+        for entry in root.iter("entry"):
+            name = entry.get("name", "")
+            if not name:
+                continue
+            ranges: list[tuple[str, int, int]] = []
+            tcp_el = entry.find(".//protocol/tcp/port")
+            if tcp_el is not None and tcp_el.text:
+                ranges.extend(_parse_port_ranges("tcp", tcp_el.text))
+            udp_el = entry.find(".//protocol/udp/port")
+            if udp_el is not None and udp_el.text:
+                ranges.extend(_parse_port_ranges("udp", udp_el.text))
+            if ranges:
+                name_to_ranges[name] = ranges
+    return name_to_ranges
+
+
+def fetch_service_group_map() -> dict[str, list[str]]:
+    """Return {group_name: [member_service_names]} for all accessible service groups."""
+    group_map: dict[str, list[str]] = {}
+    sources = ["/config/predefined/service-group", "/config/shared/service-group"]
+    if ops_lib.MODE == "panorama":
+        sources.append(
+            "/config/devices/entry[@name='localhost.localdomain']"
+            "/device-group/entry/service-group"
+        )
+    else:
+        sources.append(
+            f"/config/devices/entry[@name='localhost.localdomain']"
+            f"/vsys/entry[@name='{ops_lib.VSYS}']/service-group"
+        )
+    for xpath in sources:
+        try:
+            xml_text = ops_lib.api_get(xpath)
+            root     = ET.fromstring(xml_text)
+        except Exception:
+            continue
+        if root.get("status") == "error":
+            continue
+        for entry in root.iter("entry"):
+            name = entry.get("name", "")
+            if not name:
+                continue
+            members_el = entry.find("members")
+            if members_el is None:
+                continue
+            members = [m.text for m in members_el.findall("member") if m.text]
+            if members:
+                group_map[name] = members
+    return group_map
+
+
 def parse_app_port_details(raw: str) -> dict[str, set[str]]:
     """
     Parse the app_port_details CSV column ('ssl:tcp-443|mssql:tcp-1433' format).
@@ -482,6 +568,91 @@ def _is_raw_port_spec(s: str) -> bool:
     """Return True for bare tcp-N / udp-N specs and the two keyword values."""
     s = s.strip().lower()
     return s in ("application-default", "any") or bool(_PORT_SPEC_RE.match(s))
+
+
+# ── Port range helpers ────────────────────────────────────────────────────────
+
+def _parse_port_ranges(proto: str, spec: str) -> list[tuple[str, int, int]]:
+    """Parse a PAN-OS port spec string into (proto, lo, hi) tuples. No size limit."""
+    ranges: list[tuple[str, int, int]] = []
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            try:
+                lo, hi = (int(x) for x in part.split("-", 1))
+                ranges.append((proto.lower(), lo, hi))
+            except ValueError:
+                pass
+        else:
+            try:
+                n = int(part)
+                ranges.append((proto.lower(), n, n))
+            except ValueError:
+                pass
+    return ranges
+
+
+def _port_key_in_ranges(port_key: str, ranges: list[tuple[str, int, int]]) -> bool:
+    """Return True if a port key like 'tcp-27199' falls within any (proto, lo, hi) range."""
+    try:
+        proto, num = port_key.rsplit("-", 1)
+        n = int(num)
+        return any(p == proto.lower() and lo <= n <= hi for p, lo, hi in ranges)
+    except (ValueError, AttributeError):
+        return False
+
+
+def _resolve_svc_ranges(
+    name: str,
+    svc_map: dict[str, list[tuple[str, int, int]]],
+    grp_map: dict[str, list[str]],
+    visited: set[str],
+) -> list[tuple[str, int, int]]:
+    """Recursively resolve a service object or group name to its port ranges."""
+    if name in visited:
+        return []
+    visited.add(name)
+    if name in svc_map:
+        return svc_map[name]
+    if name in grp_map:
+        result: list[tuple[str, int, int]] = []
+        for member in grp_map[name]:
+            result.extend(_resolve_svc_ranges(member, svc_map, grp_map, visited))
+        return result
+    return []
+
+
+def consolidate_ns_service(
+    nonst_ports: set[str],
+    ports_raw: str,
+    svc_map: dict[str, list[tuple[str, int, int]]],
+    grp_map: dict[str, list[str]],
+) -> str:
+    """
+    Replace individual port specs with named service objects/groups where possible.
+
+    For each named item in the original rule's ports_raw, checks whether it covers
+    any of the observed non-standard ports. Uses the item and removes covered ports
+    from the remaining set. Uncovered ports are listed individually as before.
+    """
+    named = [p.strip() for p in ports_raw.split("|")
+             if p.strip() and not _is_raw_port_spec(p.strip())]
+    if not named:
+        return " | ".join(sorted(nonst_ports))
+
+    remaining = set(nonst_ports)
+    used: list[str] = []
+    for item in named:
+        ranges = _resolve_svc_ranges(item, svc_map, grp_map, set())
+        covered = {p for p in remaining if _port_key_in_ranges(p, ranges)}
+        if covered:
+            used.append(item)
+            remaining -= covered
+
+    parts = used + sorted(remaining)
+    return " | ".join(parts) if parts else "application-default"
 
 
 # ── Port helpers ──────────────────────────────────────────────────────────────
@@ -1149,6 +1320,11 @@ def main() -> None:
                 if _inherited:
                     app_port_map[_app] = _inherited
 
+    print("  Fetching service object map  ...", end=" ", flush=True)
+    svc_port_map  = fetch_service_port_map()
+    svc_group_map = fetch_service_group_map()
+    print(f"{len(svc_port_map)} service objects, {len(svc_group_map)} groups")
+
     print()
 
     device_group           = ops_lib.DEVICE_GROUP
@@ -1592,7 +1768,7 @@ def main() -> None:
                     "dest_zones":       "|".join(config.dest_zones),
                     "dest_addresses":   "|".join(config.dest_addrs),
                     "applications":     "|".join(nonst_apps),
-                    "service":          " | ".join(sorted(nonst_ports)),
+                    "service":          consolidate_ns_service(nonst_ports, ports_raw, svc_port_map, svc_group_map),
                     "action":           config.action,
                     "group_profile":    config.group_profile,
                     "tags_to_add":      "",
