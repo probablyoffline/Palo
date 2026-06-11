@@ -30,6 +30,8 @@ Options:
     --gone                 Include "apps no longer seen" sections (hidden by default)
     --show-unchanged       Include rules with no changes in the delta section
     --no-port-details      Suppress new port observation details in the delta section
+    --all-deltas           Generate a delta section for every consecutive pair of
+                           runs, not just the latest two.
 
 Auto-discovery groups:
     Files are grouped by the stem extracted from the filename
@@ -45,7 +47,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 # Matches: rule-apps-{stem}-{YYYYMMDD}-{HHMMSS}.csv
 # Greedy backtracking on (.+) ensures the LAST date-like suffix is the timestamp.
@@ -185,106 +187,43 @@ def _window_str(run: RunData) -> str:
     return "(window unknown — no summary file)"
 
 
-def _generate_group_report(
-    runs:             list[RunData],
-    stem:             str,
-    show_gone:        bool,
-    show_unchanged:   bool,
-    show_ports:       bool = True,
+def _generate_delta_section(
+    prev_run:       RunData,
+    curr_run:       RunData,
+    prev_idx:       int,
+    curr_idx:       int,
+    gaps_found:     list[tuple[int, datetime.timedelta, RunData, RunData]],
+    show_gone:      bool,
+    show_unchanged: bool,
+    show_ports:     bool,
+    SEP:            str,
+    DASH:           str,
 ) -> list[str]:
-    """Return lines for one stem group."""
-    SEP  = "=" * 62
-    DASH = "-" * 62
-
+    """Return lines for one consecutive-pair delta section."""
     lines: list[str] = []
     def h(s: str = "") -> None:
         lines.append(s)
 
-    first_run = runs[0]
-    last_run  = runs[-1]
-    baseline_dt = first_run.query_start or first_run.run_dt
-
     h(SEP)
-    h(f"  compare-rule-apps  v{VERSION}  —  {stem}")
-    h(SEP)
-    h(f"  Project baseline  : {baseline_dt.strftime('%Y-%m-%d')}  (query window start of Run 1)")
-    h(f"  Report generated  : {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    h(f"  Runs included     : {len(runs)}")
-    h(f"  Rules tracked     : {len(first_run.rule_order)}")
-    h()
-
-    # ── Run history ───────────────────────────────────────────────────────────
-    h(DASH)
-    h("  Run History & Coverage")
-    h(DASH)
-    h("  Note: window start dates reflect the requested range; actual log")
-    h("  coverage may be shorter depending on Panorama log retention.")
-    h()
-
-    gaps_found: list[tuple[int, datetime.timedelta, RunData, RunData]] = []
-
-    for i, run in enumerate(runs, start=1):
-        label = f"  Run {i:<3}  {run.run_dt.strftime('%Y-%m-%d')}  window: {_window_str(run)}"
-        if i == 1:
-            h(label)
-        else:
-            prev_run = runs[i - 2]
-            gap = detect_gap(prev_run, run)
-            if gap:
-                gap_start = prev_run.query_end.strftime('%Y-%m-%d')   # type: ignore[union-attr]
-                gap_end   = run.query_start.strftime('%Y-%m-%d')       # type: ignore[union-attr]
-                h(f"{label}  ** GAP: {gap.days}d ({gap_start} to {gap_end}) **")
-                gaps_found.append((i, gap, prev_run, run))
-            elif prev_run.query_end and run.query_start:
-                overlap = (prev_run.query_end - run.query_start).days
-                note = f"  [overlap: {overlap}d]" if overlap > 0 else "  [adjacent]"
-                h(f"{label}{note}")
-            else:
-                h(f"{label}  [gap status unknown — missing window data]")
-
-    h()
-    if gaps_found:
-        h(f"  Coverage gaps     : {len(gaps_found)} gap(s) found — see ** markers above")
-        for idx, gap, prev_run, curr_run in gaps_found:
-            h(
-                f"    Run {idx-1}→{idx}: {gap.days}d unchecked  "
-                f"({prev_run.query_end.strftime('%Y-%m-%d')} to {curr_run.query_start.strftime('%Y-%m-%d')})"  # type: ignore[union-attr]
-            )
-    else:
-        h("  Coverage gaps     : none")
-    h(SEP)
-    h()
-
-    if len(runs) < 2:
-        h("  Only one run loaded — need at least two runs to generate a delta.")
-        h(SEP)
-        return lines
-
-    # ── Delta: latest two runs ────────────────────────────────────────────────
-    prev_run = runs[-2]
-    curr_run = runs[-1]
-
-    h(SEP)
-    h(f"  Delta: Run {len(runs)-1} → Run {len(runs)}")
+    h(f"  Delta: Run {prev_idx} → Run {curr_idx}")
     h(f"  {prev_run.run_dt.strftime('%Y-%m-%d')} to {curr_run.run_dt.strftime('%Y-%m-%d')}")
     h(SEP)
 
-    # Warn if there's a gap immediately before this run
-    if len(gaps_found) > 0 and gaps_found[-1][0] == len(runs):
-        _, gap, _, _ = gaps_found[-1]
-        h(f"  ** Note: {gap.days}-day coverage gap precedes this run — new apps in")
-        h( "     that window may not appear in the list below. **")
-        h()
+    # Warn if there's a coverage gap immediately before curr_run
+    for gap_idx, gap, _, _ in gaps_found:
+        if gap_idx == curr_idx:
+            h(f"  ** Note: {gap.days}-day coverage gap precedes this run — new apps in")
+            h( "     that window may not appear in the list below. **")
+            h()
+            break
 
     # Compute per-rule deltas
-    # Each tuple: (rule, new_apps, gone_apps, new_port_pairs)
     rules_with_new:       list[tuple[str, frozenset, frozenset, frozenset]] = []
-    rules_with_new_ports: list[tuple[str, frozenset]]                       = []  # ports only, no new apps
+    rules_with_new_ports: list[tuple[str, frozenset]]                       = []
     rules_with_gone:      list[tuple[str, frozenset]]                       = []
     rules_unchanged:      list[str]                                         = []
     rules_skipped:        list[str]                                         = []
 
-    # Use current run's rule order as canonical; fall back to previous
     ordered = curr_run.rule_order or prev_run.rule_order
 
     for rule in ordered:
@@ -295,9 +234,9 @@ def _generate_group_report(
         prev_ports  = prev_run.ports_by_rule.get(rule, frozenset())
         curr_ports  = curr_run.ports_by_rule.get(rule, frozenset())
 
-        new_apps        = curr_apps  - prev_apps
-        gone_apps       = prev_apps  - curr_apps
-        new_port_pairs  = curr_ports - prev_ports
+        new_apps       = curr_apps  - prev_apps
+        gone_apps      = prev_apps  - curr_apps
+        new_port_pairs = curr_ports - prev_ports
 
         if curr_status == "skipped" and prev_status == "skipped":
             rules_skipped.append(rule)
@@ -369,6 +308,105 @@ def _generate_group_report(
             curr_apps = curr_run.apps_by_rule.get(rule, frozenset())
             h(f"  {rule}  ({len(curr_apps)} app(s))")
         h()
+
+    return lines
+
+
+def _generate_group_report(
+    runs:             list[RunData],
+    stem:             str,
+    show_gone:        bool,
+    show_unchanged:   bool,
+    show_ports:       bool = True,
+    all_deltas:       bool = False,
+) -> list[str]:
+    """Return lines for one stem group."""
+    SEP  = "=" * 62
+    DASH = "-" * 62
+
+    lines: list[str] = []
+    def h(s: str = "") -> None:
+        lines.append(s)
+
+    first_run = runs[0]
+    last_run  = runs[-1]
+    baseline_dt = first_run.query_start or first_run.run_dt
+
+    h(SEP)
+    h(f"  compare-rule-apps  v{VERSION}  —  {stem}")
+    h(SEP)
+    h(f"  Project baseline  : {baseline_dt.strftime('%Y-%m-%d')}  (query window start of Run 1)")
+    h(f"  Report generated  : {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    h(f"  Runs included     : {len(runs)}")
+    h(f"  Rules tracked     : {len(first_run.rule_order)}")
+    h()
+
+    # ── Run history ───────────────────────────────────────────────────────────
+    h(DASH)
+    h("  Run History & Coverage")
+    h(DASH)
+    h("  Note: window start dates reflect the requested range; actual log")
+    h("  coverage may be shorter depending on Panorama log retention.")
+    h()
+
+    gaps_found: list[tuple[int, datetime.timedelta, RunData, RunData]] = []
+
+    for i, run in enumerate(runs, start=1):
+        label = f"  Run {i:<3}  {run.run_dt.strftime('%Y-%m-%d')}  window: {_window_str(run)}"
+        if i == 1:
+            h(label)
+        else:
+            prev_run = runs[i - 2]
+            gap = detect_gap(prev_run, run)
+            if gap:
+                gap_start = prev_run.query_end.strftime('%Y-%m-%d')   # type: ignore[union-attr]
+                gap_end   = run.query_start.strftime('%Y-%m-%d')       # type: ignore[union-attr]
+                h(f"{label}  ** GAP: {gap.days}d ({gap_start} to {gap_end}) **")
+                gaps_found.append((i, gap, prev_run, run))
+            elif prev_run.query_end and run.query_start:
+                overlap = (prev_run.query_end - run.query_start).days
+                note = f"  [overlap: {overlap}d]" if overlap > 0 else "  [adjacent]"
+                h(f"{label}{note}")
+            else:
+                h(f"{label}  [gap status unknown — missing window data]")
+
+    h()
+    if gaps_found:
+        h(f"  Coverage gaps     : {len(gaps_found)} gap(s) found — see ** markers above")
+        for idx, gap, prev_run, curr_run in gaps_found:
+            h(
+                f"    Run {idx-1}→{idx}: {gap.days}d unchecked  "
+                f"({prev_run.query_end.strftime('%Y-%m-%d')} to {curr_run.query_start.strftime('%Y-%m-%d')})"  # type: ignore[union-attr]
+            )
+    else:
+        h("  Coverage gaps     : none")
+    h(SEP)
+    h()
+
+    if len(runs) < 2:
+        h("  Only one run loaded — need at least two runs to generate a delta.")
+        h(SEP)
+        return lines
+
+    # ── Delta section(s) ─────────────────────────────────────────────────────
+    if all_deltas:
+        pairs = list(zip(range(1, len(runs)), range(2, len(runs) + 1)))
+    else:
+        pairs = [(len(runs) - 1, len(runs))]
+
+    for prev_idx, curr_idx in pairs:
+        lines.extend(_generate_delta_section(
+            prev_run       = runs[prev_idx - 1],
+            curr_run       = runs[curr_idx - 1],
+            prev_idx       = prev_idx,
+            curr_idx       = curr_idx,
+            gaps_found     = gaps_found,
+            show_gone      = show_gone,
+            show_unchanged = show_unchanged,
+            show_ports     = show_ports,
+            SEP            = SEP,
+            DASH           = DASH,
+        ))
 
     # ── Cumulative: baseline vs latest ────────────────────────────────────────
     h(SEP)
@@ -466,6 +504,10 @@ def main() -> None:
         "--no-port-details", action="store_true",
         help="Suppress new port observation details in the delta section",
     )
+    parser.add_argument(
+        "--all-deltas", action="store_true",
+        help="Generate a delta section for every consecutive pair of runs, not just the latest two.",
+    )
     args = parser.parse_args()
 
     run_dt    = datetime.datetime.now()
@@ -522,6 +564,7 @@ def main() -> None:
             show_gone      = args.gone,
             show_unchanged = args.show_unchanged,
             show_ports     = not args.no_port_details,
+            all_deltas     = args.all_deltas,
         )
         all_lines.extend(group_lines)
         all_lines.append("")

@@ -8,22 +8,32 @@ review, then waits for confirmation before applying.
 Execution flow:
   1. Load design CSV
   2. Fetch existing rule names from config (one API call)
-  3. Fetch service objects from predefined / shared / DG sources
+  3. Fetch service objects from predefined / shared / all-DG sources
   4. Classify each change: READY / SKIP / BLOCKED
   5. Write staging file
   6. Print summary + prompt Enter to apply (or Ctrl+C to abort)
-  7. Apply all READY changes in CSV order
+  7. Apply all READY changes in CSV order (with per-step progress output)
   8. Write results file
 
 Row types handled:
   new_rule   — create a new security rule, then move it above clone_above
   tag_update — add tags from tags_to_add to an existing rule
+  app_update — add applications to an existing rule
 
 Service resolution:
   service = "application-default" or "any" → used directly
   service = "tcp-443 | tcp-8080"           → resolved to service object names
   If any port in an explicit service string has no matching service object,
   the change is BLOCKED and listed in the staging warnings.
+
+  Service objects are looked up from four sources in priority order:
+    1. /config/predefined/service
+    2. /config/shared/service
+    3. /config/devices/.../device-group/entry/service  (all DGs, wildcard)
+    4. /config/devices/.../device-group/<target>/service
+
+  The wildcard step 3 ensures service objects in any ancestor or sibling DG are
+  found without needing to traverse the DG hierarchy tree.
 
 Usage:
     python deploy-rule-design.py <input_csv> [options]

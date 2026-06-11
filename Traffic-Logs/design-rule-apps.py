@@ -42,6 +42,10 @@ Config files (auto-read from the same directory as this script):
                            msrpc:tcp-135   per-app: standard only for that specific app
   flags-pci.txt       — one Panorama tag name per line.  Rules tagged with any of
                         these are separated into the PCI output stream.
+  ns-split-apps.txt   — one app name per line.  Apps listed here that have 10 or more
+                        NS ports for a given rule are extracted from the combined NS
+                        rule and each get their own APP-ID-<rule>-NS-<app> design.
+                        Apps below the threshold stay in the combined NS rule.
 
 Usage:
     python design-rule-apps.py <input_csv> [<input_csv> ...] [options]
@@ -57,6 +61,7 @@ Options:
     --standard-ports FILE             Override the default standard-ports.txt path
     --risky-apps FILE                 Override the default risky-apps.txt path
     --pci-flags FILE                  Override the default flags-pci.txt path
+    --ns-split-apps FILE              Override the default ns-split-apps.txt path
     --no-csv                          Skip the structured CSV output, text only
     --update-existing                 Generate app_update designs for rules where
                                       APP-ID-<name> already exists (adds new apps)
@@ -96,11 +101,12 @@ NS rule service consolidation:
   This replaces long per-port lists (tcp-27199 | tcp-27201 | …) with the compact
   service object or group name that was already protecting those ports in the old rule.
 
-  Ephemeral port threshold: after named-object matching, if 10 or more remaining
-  individual ports fall in the ephemeral range (49152–65535) they are replaced by the
-  standard service group name tcp-49152-65535 (TCP) or udp-49152-65536 (UDP).  If those
-  groups are absent from Panorama a MISSING SERVICE GROUPS section is prepended to the
-  output listing the names that need to be created before deploying.
+  Ephemeral port threshold: after named-object matching, if total remaining ports ≥ 10
+  and any are in an ephemeral range, those ports are replaced by the service group name:
+    tcp-49152-65535 / udp-49152-65535  — Windows/RFC-6335 range
+    tcp-32768-60999 / udp-32768-60999  — Linux default range
+  Windows range is checked first; both groups can appear in the same rule.  If a group
+  is absent from Panorama a MISSING SERVICE GROUPS section is prepended to the output.
 """
 
 import argparse
@@ -121,16 +127,17 @@ requests.packages.urllib3.disable_warnings()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-__version__ = "1.11.6"
+__version__ = "1.11.8"
 
 APP_REVIEW_THRESHOLD     = 10  # flag designs with this many or more usable apps
 APP_FETCH_BATCH          = 50  # max apps per XPath filter to avoid PAN-OS XPath length limits
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
-STANDARD_PORTS_FILE = SCRIPT_DIR / "standard-ports.txt"
-RISKY_APPS_FILE     = SCRIPT_DIR / "risky-apps.txt"
-PCI_FLAGS_FILE      = SCRIPT_DIR / "flags-pci.txt"
+STANDARD_PORTS_FILE  = SCRIPT_DIR / "standard-ports.txt"
+RISKY_APPS_FILE      = SCRIPT_DIR / "risky-apps.txt"
+PCI_FLAGS_FILE       = SCRIPT_DIR / "flags-pci.txt"
+NS_SPLIT_APPS_FILE   = SCRIPT_DIR / "ns-split-apps.txt"
 
 DEFAULT_RISKY_APPS = frozenset({"ssh", "ms-rdp", "telnet", "ftp", "tftp"})
 
@@ -144,11 +151,29 @@ TAG_RISKY           = "risky-app"
 TAG_UNDER_REVIEW    = "app-id-under-review"
 TAG_UNUSED          = "app-id-review-unused"
 
-EPHEMERAL_THRESHOLD = 10          # min ephemeral ports before substituting the group
+EPHEMERAL_THRESHOLD = 10          # min total remaining ports before substituting a group
+NS_SPLIT_THRESHOLD  = 10          # min per-app NS ports to trigger a split rule
+
+# Windows/RFC-6335 ephemeral range (49152–65535)
 EPHEMERAL_PORT_LO   = 49152
 EPHEMERAL_PORT_HI   = 65535
 EPHEMERAL_TCP_GRP   = "tcp-49152-65535"
 EPHEMERAL_UDP_GRP   = "udp-49152-65535"
+
+# Linux default ephemeral range (32768–60999)
+EPHEMERAL_LINUX_PORT_LO = 32768
+EPHEMERAL_LINUX_PORT_HI = 60999
+EPHEMERAL_LINUX_TCP_GRP = "tcp-32768-60999"
+EPHEMERAL_LINUX_UDP_GRP = "udp-32768-60999"
+
+# Ordered list of ranges to check; Windows first so the overlap zone (49152–60999)
+# is claimed by the Windows group when both thresholds are met.
+_EPHEMERAL_RANGES = [
+    ("tcp", EPHEMERAL_TCP_GRP,       EPHEMERAL_PORT_LO,       EPHEMERAL_PORT_HI),
+    ("udp", EPHEMERAL_UDP_GRP,       EPHEMERAL_PORT_LO,       EPHEMERAL_PORT_HI),
+    ("tcp", EPHEMERAL_LINUX_TCP_GRP, EPHEMERAL_LINUX_PORT_LO, EPHEMERAL_LINUX_PORT_HI),
+    ("udp", EPHEMERAL_LINUX_UDP_GRP, EPHEMERAL_LINUX_PORT_LO, EPHEMERAL_LINUX_PORT_HI),
+]
 
 # Port ranges larger than this are not expanded; ports falling in them are treated
 # conservatively as non-standard (avoids huge sets for apps like ftp-data).
@@ -670,11 +695,11 @@ def consolidate_ns_service(
             remaining -= covered
 
     missing: set[str] = set()
-    for proto, grp_name in (("tcp", EPHEMERAL_TCP_GRP), ("udp", EPHEMERAL_UDP_GRP)):
+    for proto, grp_name, lo, hi in _EPHEMERAL_RANGES:
         eph_ports = {
             p for p in remaining
             if p.startswith(f"{proto}-")
-            and EPHEMERAL_PORT_LO <= int(p.split("-", 1)[1]) <= EPHEMERAL_PORT_HI
+            and lo <= int(p.split("-", 1)[1]) <= hi
         }
         if eph_ports and len(remaining) >= EPHEMERAL_THRESHOLD:
             remaining -= eph_ports
@@ -984,6 +1009,7 @@ def format_nonstandard_rule_design(
     service:        str,
     device_group:   str,
     run_month_year: str,
+    rule_suffix:    str = "-NS",
 ) -> str:
     tags = list(config.existing_tags) + [TAG_NEW_RULE, TAG_NON_STANDARD]
 
@@ -991,7 +1017,7 @@ def format_nonstandard_rule_design(
     lines += [
         f"In {device_group}",
         f"Clone Rule ABOVE: {rule_name}",
-        f"New Rule Name: APP-ID-{rule_name}-NS",
+        f"New Rule Name: APP-ID-{rule_name}{rule_suffix}",
         f"Description: DDD created {run_month_year}",
         f"Tags: {_csv_list(tags)}",
         "",
@@ -1007,7 +1033,7 @@ def format_nonstandard_rule_design(
         f"Dest Address: {_csv_list(config.dest_addrs)}",
         "",
         f"Application: {_csv_list(nonst_apps)}",
-        f"Port: {service}",
+        f"Port: {service.replace(' | ', ', ')}",
         f"Action: {config.action}",
         f"Group profile: {config.group_profile or '(none)'}",
     ]
@@ -1194,6 +1220,12 @@ def main() -> None:
              f" omit file to disable PCI splitting)",
     )
     parser.add_argument(
+        "--ns-split-apps", metavar="FILE", dest="ns_split_apps_file",
+        help=f"File listing app names to split into per-app NS rules"
+             f" (default: {NS_SPLIT_APPS_FILE.name} in script directory;"
+             f" omit file to disable per-app splitting)",
+    )
+    parser.add_argument(
         "--no-csv", action="store_true",
         help="Skip the structured CSV output; generate text design file only",
     )
@@ -1250,6 +1282,11 @@ def main() -> None:
 
     pf_path  = Path(args.pci_flags_file) if args.pci_flags_file else PCI_FLAGS_FILE
     pci_tags = load_set_from_file(pf_path, default=frozenset(), label="pci-flags")
+
+    nsa_path = Path(args.ns_split_apps_file) if args.ns_split_apps_file else NS_SPLIT_APPS_FILE
+    ns_split_apps: set[str] = set()
+    if nsa_path.exists():
+        ns_split_apps = load_set_from_file(nsa_path, default=frozenset(), label="ns-split-apps")
     if pci_tags and not args.no_csv:
         print(f"  PCI csv     : {pci_csv_path}")
 
@@ -1412,6 +1449,7 @@ def main() -> None:
         std_observed_apps:   list[str] = []
         nonst_observed_apps: list[str] = []
         nonst_ports:         set[str]  = set()
+        nonst_app_ports:     dict[str, set[str]] = {}
 
         unknown_std_apps: list[str] = []  # observed apps with no standard port data
         if dynamic_available and app_port_obs:
@@ -1428,6 +1466,7 @@ def main() -> None:
                 app_nonst   = (obs_for_app - app_std_eff) if app_std_eff else set()
                 if app_nonst:
                     nonst_ports |= app_nonst
+                    nonst_app_ports[app] = app_nonst
                     nonst_observed_apps.append(app)
                 if obs_for_app - app_nonst:       # also seen on standard ports
                     std_observed_apps.append(app)
@@ -1503,6 +1542,23 @@ def main() -> None:
         # Main rule never gets TAG_NON_STANDARD or TAG_RISKY — those go to their own rules
         new_rule_tags: list[str] = list(config.existing_tags) + [TAG_NEW_RULE]
 
+        # ── Partition per-app NS splits ───────────────────────────────────────
+        split_ns_designs: list[tuple[str, set[str]]] = []  # (app_name, ns_ports)
+        if ns_split_apps and nonst_apps:
+            split_names = {a for a in nonst_apps if a.lower() in ns_split_apps}
+            if split_names:
+                split_ns_designs = [
+                    (a, nonst_app_ports.get(a, set()))
+                    for a in nonst_apps
+                    if a in split_names
+                    and len(nonst_app_ports.get(a, set())) >= NS_SPLIT_THRESHOLD
+                ]
+                split_app_names = {a for a, _ in split_ns_designs}
+                nonst_apps  = [a for a in nonst_apps  if a not in split_app_names]
+                nonst_ports = nonst_ports - {
+                    p for _, ports in split_ns_designs for p in ports
+                }
+
         # ── Check for existing APP-ID rules ───────────────────────────────────
         known_exists       = configs[f"APP-ID-{rule_name}"].found
         unknown_exists     = configs[f"APP-ID-{rule_name}-UNKNOWN"].found
@@ -1555,6 +1611,19 @@ def main() -> None:
             else:
                 design_count += 1; nonstandard_upd_num = design_count
                 app_update_count += 1
+
+        split_ns_nums: list[tuple[str, set[str], int | str]] = []
+        for sn_app, sn_ports in split_ns_designs:
+            if not sn_ports:
+                continue
+            if pci:
+                pci_design_count += 1
+                split_ns_nums.append((sn_app, sn_ports, f"PCI-{pci_design_count}"))
+                pci_new_rule_count += 1
+            else:
+                design_count += 1
+                split_ns_nums.append((sn_app, sn_ports, design_count))
+                nonstandard_rule_count += 1
 
         if generate_risky:
             if pci:
@@ -1639,6 +1708,14 @@ def main() -> None:
                 f"Design {nonstandard_num} — {rule_name}",
                 f"non-standard port traffic detected: {ns_detail} — "
                 f"separate NS rule generated.",
+            ))
+        for sn_app, sn_ports, sn_num in split_ns_nums:
+            sn_detail = (f"{len(sn_ports)}+ ports" if len(sn_ports) > 10
+                         else ', '.join(sorted(sn_ports)))
+            notes.append((
+                f"Design {sn_num} — {rule_name}",
+                f"split NS rule for {sn_app}: {sn_detail} — "
+                f"separate NS-{sn_app} rule generated.",
             ))
         if risky_exists and risky_app_list:
             notes.append((
@@ -1732,6 +1809,22 @@ def main() -> None:
                 rule_suffix   = "-NS",
             ))
 
+        for sn_app, sn_ports, sn_num in split_ns_nums:
+            _sn_svc, _sn_missing = consolidate_ns_service(
+                sn_ports, ports_raw, svc_port_map, svc_group_map
+            )
+            missing_svc_groups |= _sn_missing
+            _new_designs.append(format_nonstandard_rule_design(
+                design_number  = sn_num,
+                rule_name      = rule_name,
+                config         = config,
+                nonst_apps     = [sn_app],
+                service        = _sn_svc,
+                device_group   = device_group,
+                run_month_year = run_month_year,
+                rule_suffix    = f"-NS-{sn_app}",
+            ))
+
         if generate_risky:
             _new_designs.append(format_risky_rule_design(
                 design_number  = risky_num,
@@ -1811,6 +1904,31 @@ def main() -> None:
                 })
             elif nonstandard_upd_num is not None:
                 _csv.append(build_app_update_row(rule_name, nonst_apps, device_group, rule_suffix="-NS"))
+
+            for sn_app, sn_ports, sn_num in split_ns_nums:
+                _sn_svc_c, _ = consolidate_ns_service(
+                    sn_ports, ports_raw, svc_port_map, svc_group_map
+                )
+                sn_tags = list(config.existing_tags) + [TAG_NEW_RULE, TAG_NON_STANDARD]
+                non_any_users = [u for u in config.source_users if u.lower() != "any"]
+                _csv.append({
+                    "type":             "new_rule",
+                    "device_group":     device_group,
+                    "rule_name":        f"APP-ID-{rule_name}-NS-{sn_app}",
+                    "clone_above":      rule_name,
+                    "description":      f"DDD created {run_month_year}",
+                    "tags":             "|".join(sn_tags),
+                    "source_zones":     "|".join(config.source_zones),
+                    "source_addresses": "|".join(config.source_addrs),
+                    "source_user":      "|".join(non_any_users),
+                    "dest_zones":       "|".join(config.dest_zones),
+                    "dest_addresses":   "|".join(config.dest_addrs),
+                    "applications":     sn_app,
+                    "service":          _sn_svc_c,
+                    "action":           config.action,
+                    "group_profile":    config.group_profile,
+                    "tags_to_add":      "",
+                })
 
             if generate_risky:
                 risky_tags = list(config.existing_tags) + [TAG_NEW_RULE, TAG_RISKY]
