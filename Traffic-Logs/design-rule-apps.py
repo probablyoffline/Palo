@@ -121,7 +121,7 @@ requests.packages.urllib3.disable_warnings()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-__version__ = "1.11.5"
+__version__ = "1.11.6"
 
 APP_REVIEW_THRESHOLD     = 10  # flag designs with this many or more usable apps
 APP_FETCH_BATCH          = 50  # max apps per XPath filter to avoid PAN-OS XPath length limits
@@ -676,7 +676,7 @@ def consolidate_ns_service(
             if p.startswith(f"{proto}-")
             and EPHEMERAL_PORT_LO <= int(p.split("-", 1)[1]) <= EPHEMERAL_PORT_HI
         }
-        if len(eph_ports) >= EPHEMERAL_THRESHOLD:
+        if eph_ports and len(remaining) >= EPHEMERAL_THRESHOLD:
             remaining -= eph_ports
             used.append(grp_name)
             if grp_name not in svc_map and grp_name not in grp_map:
@@ -1633,9 +1633,11 @@ def main() -> None:
                     f"APP-ID-{rule_name}-NS already exists — skipped. Use --update-existing to add new apps.",
                 ))
         if generate_nonstandard:
+            ns_detail = (f"{len(nonst_ports)}+ ports" if len(nonst_ports) > 10
+                         else ', '.join(sorted(nonst_ports)))
             notes.append((
                 f"Design {nonstandard_num} — {rule_name}",
-                f"non-standard port traffic detected: {', '.join(sorted(nonst_ports))} — "
+                f"non-standard port traffic detected: {ns_detail} — "
                 f"separate NS rule generated.",
             ))
         if risky_exists and risky_app_list:
