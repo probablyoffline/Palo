@@ -64,12 +64,13 @@ Options:
                                       (default: 10)
 
 Output .txt sections (in order):
-    SUMMARY          — counters, file paths, PCI breakdown (if applicable)
-    NOTES            — per-design warnings (named service objects, dropped ports, etc.)
-    NEW RULES        — APP-ID-*, APP-ID-*-UNKNOWN, APP-ID-*-NS creations
-    RULE UPDATES     — tag additions to existing rules (app-id-under-review, etc.)
-    PCI — NEW RULES  — same as NEW RULES, PCI-scoped rules only (if applicable)
-    PCI — RULE UPDATES — same as RULE UPDATES, PCI-scoped rules only (if applicable)
+    SUMMARY                — counters, file paths, PCI breakdown (if applicable)
+    MISSING SERVICE GROUPS — ephemeral group names used but absent from Panorama (if any)
+    NOTES                  — per-design warnings (named service objects, dropped ports, etc.)
+    NEW RULES              — APP-ID-*, APP-ID-*-UNKNOWN, APP-ID-*-NS creations
+    RULE UPDATES           — tag additions to existing rules (app-id-under-review, etc.)
+    PCI — NEW RULES        — same as NEW RULES, PCI-scoped rules only (if applicable)
+    PCI — RULE UPDATES     — same as RULE UPDATES, PCI-scoped rules only (if applicable)
 
 Design logic:
   - Rules with apps observed → new APP-ID-<name> rule design above old rule
@@ -94,6 +95,12 @@ NS rule service consolidation:
     - Any observed port not covered by a named object remains listed individually.
   This replaces long per-port lists (tcp-27199 | tcp-27201 | …) with the compact
   service object or group name that was already protecting those ports in the old rule.
+
+  Ephemeral port threshold: after named-object matching, if 10 or more remaining
+  individual ports fall in the ephemeral range (49152–65535) they are replaced by the
+  standard service group name tcp-49152-65535 (TCP) or udp-49152-65536 (UDP).  If those
+  groups are absent from Panorama a MISSING SERVICE GROUPS section is prepended to the
+  output listing the names that need to be created before deploying.
 """
 
 import argparse
@@ -114,7 +121,7 @@ requests.packages.urllib3.disable_warnings()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-__version__ = "1.11.3"
+__version__ = "1.11.4"
 
 APP_REVIEW_THRESHOLD     = 10  # flag designs with this many or more usable apps
 APP_FETCH_BATCH          = 50  # max apps per XPath filter to avoid PAN-OS XPath length limits
@@ -136,6 +143,12 @@ TAG_UNKNOWN         = "app-id-unknown"
 TAG_RISKY           = "risky-app"
 TAG_UNDER_REVIEW    = "app-id-under-review"
 TAG_UNUSED          = "app-id-review-unused"
+
+EPHEMERAL_THRESHOLD = 10          # min ephemeral ports before substituting the group
+EPHEMERAL_PORT_LO   = 49152
+EPHEMERAL_PORT_HI   = 65535
+EPHEMERAL_TCP_GRP   = "tcp-49152-65535"
+EPHEMERAL_UDP_GRP   = "udp-49152-65536"
 
 # Port ranges larger than this are not expanded; ports falling in them are treated
 # conservatively as non-standard (avoids huge sets for apps like ftp-data).
@@ -629,18 +642,23 @@ def consolidate_ns_service(
     ports_raw: str,
     svc_map: dict[str, list[tuple[str, int, int]]],
     grp_map: dict[str, list[str]],
-) -> str:
+) -> tuple[str, set[str]]:
     """
     Replace individual port specs with named service objects/groups where possible.
 
-    For each named item in the original rule's ports_raw, checks whether it covers
-    any of the observed non-standard ports. Uses the item and removes covered ports
-    from the remaining set. Uncovered ports are listed individually as before.
+    Phase 1 — named objects: for each named item in the original rule's ports_raw,
+    checks whether it covers any observed non-standard ports and removes covered ports
+    from the remaining set.
+
+    Phase 2 — ephemeral threshold: if 10+ remaining ports are in the ephemeral range
+    (49152–65535), substitutes the standard ephemeral service group name instead of
+    listing them individually.
+
+    Returns (service_str, missing_groups) where missing_groups is the set of ephemeral
+    group names used but absent from Panorama (need to be created before deploying).
     """
     named = [p.strip() for p in ports_raw.split("|")
              if p.strip() and not _is_raw_port_spec(p.strip())]
-    if not named:
-        return " | ".join(sorted(nonst_ports))
 
     remaining = set(nonst_ports)
     used: list[str] = []
@@ -651,8 +669,21 @@ def consolidate_ns_service(
             used.append(item)
             remaining -= covered
 
+    missing: set[str] = set()
+    for proto, grp_name in (("tcp", EPHEMERAL_TCP_GRP), ("udp", EPHEMERAL_UDP_GRP)):
+        eph_ports = {
+            p for p in remaining
+            if p.startswith(f"{proto}-")
+            and EPHEMERAL_PORT_LO <= int(p.split("-", 1)[1]) <= EPHEMERAL_PORT_HI
+        }
+        if len(eph_ports) >= EPHEMERAL_THRESHOLD:
+            remaining -= eph_ports
+            used.append(grp_name)
+            if grp_name not in svc_map and grp_name not in grp_map:
+                missing.add(grp_name)
+
     parts = used + sorted(remaining)
-    return " | ".join(parts) if parts else "application-default"
+    return (" | ".join(parts) if parts else "application-default"), missing
 
 
 # ── Port helpers ──────────────────────────────────────────────────────────────
@@ -1335,6 +1366,7 @@ def main() -> None:
     update_designs_pci:   list[str] = []
     csv_rows_pci:         list[dict] = []
     notes: list[str]            = []
+    missing_svc_groups: set[str] = set()
     design_count               = 0
     new_rule_count             = 0
     unknown_rule_count         = 0
@@ -1755,6 +1787,10 @@ def main() -> None:
             if generate_nonstandard:
                 nonst_tags = list(config.existing_tags) + [TAG_NEW_RULE, TAG_NON_STANDARD]
                 non_any_users = [u for u in config.source_users if u.lower() != "any"]
+                _ns_svc, _ns_missing = consolidate_ns_service(
+                    nonst_ports, ports_raw, svc_port_map, svc_group_map
+                )
+                missing_svc_groups |= _ns_missing
                 _csv.append({
                     "type":             "new_rule",
                     "device_group":     device_group,
@@ -1768,7 +1804,7 @@ def main() -> None:
                     "dest_zones":       "|".join(config.dest_zones),
                     "dest_addresses":   "|".join(config.dest_addrs),
                     "applications":     "|".join(nonst_apps),
-                    "service":          consolidate_ns_service(nonst_ports, ports_raw, svc_port_map, svc_group_map),
+                    "service":          _ns_svc,
                     "action":           config.action,
                     "group_profile":    config.group_profile,
                     "tags_to_add":      "",
@@ -1834,6 +1870,15 @@ def main() -> None:
             f"Named svc   : {named_service_count} rule(s) with named service objects (→ application-default)"
         )
     preamble = ["\n".join(summary_lines)]
+
+    if missing_svc_groups:
+        msg_lines = ["MISSING SERVICE GROUPS", SEP, "",
+                     "The following service groups are referenced in NS rule designs",
+                     "but were not found in Panorama.  Create them before deploying:",
+                     ""]
+        for grp in sorted(missing_svc_groups):
+            msg_lines.append(f"  {grp}")
+        preamble.append("\n".join(msg_lines))
 
     if notes:
         pad = max(len(p) for p, _ in notes)
