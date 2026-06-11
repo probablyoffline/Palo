@@ -121,7 +121,7 @@ requests.packages.urllib3.disable_warnings()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-__version__ = "1.11.4"
+__version__ = "1.11.5"
 
 APP_REVIEW_THRESHOLD     = 10  # flag designs with this many or more usable apps
 APP_FETCH_BATCH          = 50  # max apps per XPath filter to avoid PAN-OS XPath length limits
@@ -148,7 +148,7 @@ EPHEMERAL_THRESHOLD = 10          # min ephemeral ports before substituting the 
 EPHEMERAL_PORT_LO   = 49152
 EPHEMERAL_PORT_HI   = 65535
 EPHEMERAL_TCP_GRP   = "tcp-49152-65535"
-EPHEMERAL_UDP_GRP   = "udp-49152-65536"
+EPHEMERAL_UDP_GRP   = "udp-49152-65535"
 
 # Port ranges larger than this are not expanded; ports falling in them are treated
 # conservatively as non-standard (avoids huge sets for apps like ftp-data).
@@ -981,12 +981,11 @@ def format_nonstandard_rule_design(
     rule_name:      str,
     config:         RuleConfig,
     nonst_apps:     list[str],
-    nonst_ports:    list[str],
+    service:        str,
     device_group:   str,
     run_month_year: str,
 ) -> str:
     tags = list(config.existing_tags) + [TAG_NEW_RULE, TAG_NON_STANDARD]
-    service = ", ".join(nonst_ports)
 
     lines = [f"Design {design_number}", ""]
     lines += [
@@ -1709,13 +1708,16 @@ def main() -> None:
             ))
 
         if generate_nonstandard:
-            nonst_ports_sorted = sorted(nonst_ports)
+            _ns_svc, _ns_missing = consolidate_ns_service(
+                nonst_ports, ports_raw, svc_port_map, svc_group_map
+            )
+            missing_svc_groups |= _ns_missing
             _new_designs.append(format_nonstandard_rule_design(
                 design_number  = nonstandard_num,
                 rule_name      = rule_name,
                 config         = config,
                 nonst_apps     = nonst_apps,
-                nonst_ports    = nonst_ports_sorted,
+                service        = _ns_svc,
                 device_group   = device_group,
                 run_month_year = run_month_year,
             ))
@@ -1787,10 +1789,6 @@ def main() -> None:
             if generate_nonstandard:
                 nonst_tags = list(config.existing_tags) + [TAG_NEW_RULE, TAG_NON_STANDARD]
                 non_any_users = [u for u in config.source_users if u.lower() != "any"]
-                _ns_svc, _ns_missing = consolidate_ns_service(
-                    nonst_ports, ports_raw, svc_port_map, svc_group_map
-                )
-                missing_svc_groups |= _ns_missing
                 _csv.append({
                     "type":             "new_rule",
                     "device_group":     device_group,
