@@ -1,4 +1,4 @@
-# standard-ports.txt  v1.1.0
+# standard-ports.txt  v1.2.0
 #
 # Used in two ways by design-rule-apps.py:
 #
@@ -60,6 +60,10 @@ ssl:tcp-3269
 kerberos:tcp-88
 kerberos:udp-88
 # SMB apps — add other variants if they appear in your traffic
+ms-ds-smbv1:tcp-445
+ms-ds-smbv1:udp-445
+ms-ds-smbv2:tcp-445
+ms-ds-smbv2:udp-445
 ms-ds-smbv3:tcp-445
 ms-ds-smbv3:udp-445
 ms-ds-smb-base:tcp-445
