@@ -1,0 +1,28 @@
+# ns-split-apps.txt  v1.0.0
+#
+# Apps listed here are candidates for their own non-standard port rule.
+# When design-rule-apps.py sees an app from this list with 10 or more
+# non-standard ports in a rule, it generates a separate design:
+#
+#   APP-ID-<rule>-NS-<app>
+#
+# instead of bundling it into the combined APP-ID-<rule>-NS rule.
+# Apps with fewer than 10 NS ports for a given rule are left in the
+# combined NS rule regardless of whether they appear here.
+#
+# App names must match exactly what PAN-OS returns in the traffic log
+# 'app' field (lowercase). Lines starting with # are comments.
+#
+# When to add an app here:
+#   - You observe it repeatedly generating large NS port lists across runs
+#   - Its NS traffic comes from a distinct source/pattern (e.g. ephemeral
+#     client ports from a high-volume service like DNS or NTP)
+#   - Keeping it separate makes the combined NS rule cleaner/shorter
+
+# ── DNS ───────────────────────────────────────────────────────────────────────
+# dns-base
+
+# ── Examples (uncomment to enable) ───────────────────────────────────────────
+# ntp-base
+# kerberos
+# msrpc
