@@ -127,7 +127,7 @@ requests.packages.urllib3.disable_warnings()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-__version__ = "1.11.8"
+__version__ = "1.11.9"
 
 APP_REVIEW_THRESHOLD     = 10  # flag designs with this many or more usable apps
 APP_FETCH_BATCH          = 50  # max apps per XPath filter to avoid PAN-OS XPath length limits
@@ -1835,7 +1835,8 @@ def main() -> None:
                 run_month_year = run_month_year,
             ))
 
-        _upd_designs.append(format_rule_update(update_num, rule_name, TAG_UNDER_REVIEW, device_group, run_month_year))
+        if TAG_UNDER_REVIEW not in config.existing_tags:
+            _upd_designs.append(format_rule_update(update_num, rule_name, TAG_UNDER_REVIEW, device_group, run_month_year))
 
         # ── CSV rows ──────────────────────────────────────────────────────────
         if not args.no_csv:
@@ -1952,7 +1953,8 @@ def main() -> None:
                     "tags_to_add":      "",
                 })
 
-            _csv.append(build_tag_update_row(rule_name, TAG_UNDER_REVIEW, device_group))
+            if TAG_UNDER_REVIEW not in config.existing_tags:
+                _csv.append(build_tag_update_row(rule_name, TAG_UNDER_REVIEW, device_group))
 
     SEP = "=" * 62
 
