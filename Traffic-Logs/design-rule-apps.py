@@ -127,7 +127,7 @@ requests.packages.urllib3.disable_warnings()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-__version__ = "1.11.12"
+__version__ = "1.11.13"
 
 APP_REVIEW_THRESHOLD     = 10  # flag designs with this many or more usable apps
 APP_FETCH_BATCH          = 50  # max apps per XPath filter to avoid PAN-OS XPath length limits
@@ -846,7 +846,7 @@ def format_unknown_rule_design(
 ) -> str:
     new_rule_name = f"APP-ID-{rule_name}-UNKNOWN" if has_known_apps else f"APP-ID-{rule_name}"
 
-    tags = list(config.existing_tags) + [TAG_NEW_RULE, TAG_UNKNOWN]
+    tags = [t for t in config.existing_tags if t != TAG_UNUSED] + [TAG_NEW_RULE, TAG_UNKNOWN]
 
     ports = [p.strip() for p in ports_raw.split("|") if p.strip()]
     service = ", ".join(ports) if ports and ports != ["application-default"] else "application-default"
@@ -1011,7 +1011,7 @@ def format_nonstandard_rule_design(
     run_month_year: str,
     rule_suffix:    str = "-NS",
 ) -> str:
-    tags = list(config.existing_tags) + [TAG_NEW_RULE, TAG_NON_STANDARD]
+    tags = [t for t in config.existing_tags if t != TAG_UNUSED] + [TAG_NEW_RULE, TAG_NON_STANDARD]
 
     lines = [f"Design {design_number}", ""]
     lines += [
@@ -1048,7 +1048,7 @@ def format_risky_rule_design(
     device_group:   str,
     run_month_year: str,
 ) -> str:
-    tags = list(config.existing_tags) + [TAG_NEW_RULE, TAG_RISKY]
+    tags = [t for t in config.existing_tags if t != TAG_UNUSED] + [TAG_NEW_RULE, TAG_RISKY]
 
     lines = [f"Design {design_number}", ""]
     lines += [
@@ -1425,8 +1425,9 @@ def main() -> None:
         apps_raw     = row.get("apps", "").strip()
         ports_raw    = row.get("ports", "").strip()
         app_port_raw = row.get("app_port_details", "").strip()
-        config       = configs[rule_name]
-        pci          = is_pci_rule(config, pci_tags)
+        config             = configs[rule_name]
+        base_existing_tags = [t for t in config.existing_tags if t != TAG_UNUSED]
+        pci                = is_pci_rule(config, pci_tags)
 
         usable_apps, unknown_apps, has_risky = classify_apps(apps_raw, risky_apps)
         risky_app_list = [a for a in usable_apps if a.lower() in risky_apps]
@@ -1487,7 +1488,8 @@ def main() -> None:
             continue
 
         if complete == "skipped" or has_no_apps:
-            if not args.update_existing:
+            skip_unused = args.update_existing and TAG_UNUSED in config.existing_tags
+            if not skip_unused:
                 app_id_deployed = configs[f"APP-ID-{rule_name}"].found
                 if not app_id_deployed and TAG_UNUSED not in config.existing_tags:
                     if pci:
@@ -1543,7 +1545,7 @@ def main() -> None:
             service, _ = determine_port_setting(effective_ports_raw, rule_std_ports)
 
         # Main rule never gets TAG_NON_STANDARD or TAG_RISKY — those go to their own rules
-        new_rule_tags: list[str] = list(config.existing_tags) + [TAG_NEW_RULE]
+        new_rule_tags: list[str] = list(base_existing_tags) + [TAG_NEW_RULE]
 
         # ── Partition per-app NS splits ───────────────────────────────────────
         split_ns_designs: list[tuple[str, set[str]]] = []  # (app_name, ns_ports)
@@ -1860,7 +1862,7 @@ def main() -> None:
 
             if generate_unknown:
                 unknown_csv_name = f"APP-ID-{rule_name}-UNKNOWN" if main_apps else f"APP-ID-{rule_name}"
-                unknown_tags = list(config.existing_tags) + [TAG_NEW_RULE, TAG_UNKNOWN]
+                unknown_tags = list(base_existing_tags) + [TAG_NEW_RULE, TAG_UNKNOWN]
                 non_any_users = [u for u in config.source_users if u.lower() != "any"]
                 u_ports = [p.strip() for p in (effective_ports_raw or "").split("|") if p.strip()]
                 unknown_service = (" | ".join(u_ports)
@@ -1886,7 +1888,7 @@ def main() -> None:
                 })
 
             if generate_nonstandard:
-                nonst_tags = list(config.existing_tags) + [TAG_NEW_RULE, TAG_NON_STANDARD]
+                nonst_tags = list(base_existing_tags) + [TAG_NEW_RULE, TAG_NON_STANDARD]
                 non_any_users = [u for u in config.source_users if u.lower() != "any"]
                 _csv.append({
                     "type":             "new_rule",
@@ -1913,7 +1915,7 @@ def main() -> None:
                 _sn_svc_c, _ = consolidate_ns_service(
                     sn_ports, ports_raw, svc_port_map, svc_group_map
                 )
-                sn_tags = list(config.existing_tags) + [TAG_NEW_RULE, TAG_NON_STANDARD]
+                sn_tags = list(base_existing_tags) + [TAG_NEW_RULE, TAG_NON_STANDARD]
                 non_any_users = [u for u in config.source_users if u.lower() != "any"]
                 _csv.append({
                     "type":             "new_rule",
@@ -1935,7 +1937,7 @@ def main() -> None:
                 })
 
             if generate_risky:
-                risky_tags = list(config.existing_tags) + [TAG_NEW_RULE, TAG_RISKY]
+                risky_tags = list(base_existing_tags) + [TAG_NEW_RULE, TAG_RISKY]
                 non_any_users = [u for u in config.source_users if u.lower() != "any"]
                 _csv.append({
                     "type":             "new_rule",
