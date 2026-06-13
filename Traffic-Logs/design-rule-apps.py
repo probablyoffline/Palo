@@ -127,7 +127,7 @@ requests.packages.urllib3.disable_warnings()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-__version__ = "1.11.10"
+__version__ = "1.11.11"
 
 APP_REVIEW_THRESHOLD     = 10  # flag designs with this many or more usable apps
 APP_FETCH_BATCH          = 50  # max apps per XPath filter to avoid PAN-OS XPath length limits
@@ -1488,7 +1488,7 @@ def main() -> None:
 
         if complete == "skipped" or has_no_apps:
             app_id_deployed = configs[f"APP-ID-{rule_name}"].found
-            if not app_id_deployed:
+            if not app_id_deployed and TAG_UNUSED not in config.existing_tags:
                 if pci:
                     pci_design_count += 1
                     _dnum = f"PCI-{pci_design_count}"
