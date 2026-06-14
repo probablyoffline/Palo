@@ -83,5 +83,10 @@ syslog:udp-514
 # Panorama defines the port on the parent entry only, not the child entry.
 msrpc:tcp-135
 msrpc-base:tcp-135
+# RPC dynamic ports — Windows ephemeral range is standard for these apps.
+# Ranges are supported as proto-LO-HI (e.g. tcp-49152-65535).
+msrpc:tcp-49152-65535
+msrpc-base:tcp-49152-65535
+rpc:tcp-49152-65535
 # udp-1434 is the SQL Server Browser service port (standard for mssql-mon).
 mssql-mon:udp-1434

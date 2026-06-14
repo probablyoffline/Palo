@@ -1,0 +1,20 @@
+# exclude-new-rule-tags.txt
+#
+# Tags listed here are stripped from the inherited tag list on all new
+# APP-ID-* rule designs.  They still appear on the original rule's
+# tag-update design (app-id-under-review) as normal.
+#
+# Use this for tags that are specific to the original port-based rule
+# and should not carry over to new App-ID rules.
+#
+# Format: one Panorama tag name per line, exact match (case-sensitive).
+# Lines starting with # are comments.
+#
+# Built-in exclusions (always stripped, no need to list here):
+#   app-id-under-review
+#   app-id-review-unused
+#
+# Example:
+# pci-dss
+# legacy-rule
+# firewall-team-review

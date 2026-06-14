@@ -25,4 +25,3 @@
 # ── Examples (uncomment to enable) ───────────────────────────────────────────
 # ntp-base
 # kerberos
-# msrpc

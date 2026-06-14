@@ -42,10 +42,13 @@ Config files (auto-read from the same directory as this script):
                            msrpc:tcp-135   per-app: standard only for that specific app
   flags-pci.txt       — one Panorama tag name per line.  Rules tagged with any of
                         these are separated into the PCI output stream.
-  ns-split-apps.txt   — one app name per line.  Apps listed here that have 10 or more
-                        NS ports for a given rule are extracted from the combined NS
-                        rule and each get their own APP-ID-<rule>-NS-<app> design.
-                        Apps below the threshold stay in the combined NS rule.
+  ns-split-apps.txt        — one app name per line.  Apps listed here that have 10 or more
+                             NS ports for a given rule are extracted from the combined NS
+                             rule and each get their own APP-ID-<rule>-NS-<app> design.
+                             Apps below the threshold stay in the combined NS rule.
+  exclude-new-rule-tags.txt — one Panorama tag name per line.  Tags listed here are stripped
+                             from the inherited tag list on all new APP-ID-* rule designs
+                             (they still apply to the original rule's tag-update design).
 
 Usage:
     python design-rule-apps.py <input_csv> [<input_csv> ...] [options]
@@ -62,6 +65,7 @@ Options:
     --risky-apps FILE                 Override the default risky-apps.txt path
     --pci-flags FILE                  Override the default flags-pci.txt path
     --ns-split-apps FILE              Override the default ns-split-apps.txt path
+    --exclude-tags FILE               Override the default exclude-new-rule-tags.txt path
     --no-csv                          Skip the structured CSV output, text only
     --update-existing                 Generate app_update designs for rules where
                                       APP-ID-<name> already exists (adds new apps)
@@ -127,17 +131,18 @@ requests.packages.urllib3.disable_warnings()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-__version__ = "1.11.12"
+__version__ = "1.11.14"
 
 APP_REVIEW_THRESHOLD     = 10  # flag designs with this many or more usable apps
 APP_FETCH_BATCH          = 50  # max apps per XPath filter to avoid PAN-OS XPath length limits
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
-STANDARD_PORTS_FILE  = SCRIPT_DIR / "standard-ports.txt"
-RISKY_APPS_FILE      = SCRIPT_DIR / "risky-apps.txt"
-PCI_FLAGS_FILE       = SCRIPT_DIR / "flags-pci.txt"
-NS_SPLIT_APPS_FILE   = SCRIPT_DIR / "ns-split-apps.txt"
+STANDARD_PORTS_FILE    = SCRIPT_DIR / "standard-ports.txt"
+RISKY_APPS_FILE        = SCRIPT_DIR / "risky-apps.txt"
+PCI_FLAGS_FILE         = SCRIPT_DIR / "flags-pci.txt"
+NS_SPLIT_APPS_FILE     = SCRIPT_DIR / "ns-split-apps.txt"
+EXCLUDE_NEW_RULE_TAGS_FILE = SCRIPT_DIR / "exclude-new-rule-tags.txt"
 
 DEFAULT_RISKY_APPS = frozenset({"ssh", "ms-rdp", "telnet", "ftp", "tftp"})
 
@@ -229,25 +234,37 @@ def load_set_from_file(
     return result
 
 
+_RANGE_RE = re.compile(r'^(tcp|udp)-(\d+)-(\d+)$')
+
+def _port_in_ranges(port_spec: str, ranges: list[tuple[str, int, int]]) -> bool:
+    """Return True if port_spec (e.g. 'tcp-49200') falls within any of the given ranges."""
+    m = re.match(r'^(tcp|udp)-(\d+)$', port_spec)
+    if not m:
+        return False
+    proto, num = m.group(1), int(m.group(2))
+    return any(proto == rp and rlo <= num <= rhi for rp, rlo, rhi in ranges)
+
+
 def load_standard_ports_file(
     path: Path,
     require: bool,
     label: str,
-) -> tuple[set[str], dict[str, set[str]]]:
+) -> tuple[set[str], dict[str, set[str]], dict[str, list[tuple[str, int, int]]]]:
     """
-    Load standard-ports.txt supporting two line formats:
-      tcp-80            — global: treated as standard for any app observed on this port
-      msrpc:tcp-135     — per-app: treated as standard only when this specific app is
-                          observed on this port
-    Returns (global_ports, per_app_ports).
+    Load standard-ports.txt supporting three line formats:
+      tcp-80                — global: treated as standard for any app on this port
+      msrpc:tcp-135         — per-app single port: standard only for that specific app
+      msrpc:tcp-49152-65535 — per-app range: any port in the range is standard for that app
+    Returns (global_ports, per_app_ports, per_app_ranges).
     If the file is missing and require=True, a warning is printed; otherwise silent.
     """
     if not path.exists():
         if require:
             print(f"  Warning: {label} not found ({path.name}) — treating all explicit ports as non-standard")
-        return set(), {}
+        return set(), {}, {}
     global_ports: set[str] = set()
     per_app: dict[str, set[str]] = {}
+    per_app_ranges: dict[str, list[tuple[str, int, int]]] = {}
     with open(path, encoding="utf-8") as fh:
         for line in fh:
             s = line.strip().lower()
@@ -258,14 +275,20 @@ def load_standard_ports_file(
                 app_name = app_name.strip()
                 port_spec = port_spec.strip()
                 if app_name and port_spec:
-                    per_app.setdefault(app_name, set()).add(port_spec)
+                    rm = _RANGE_RE.match(port_spec)
+                    if rm:
+                        proto, lo, hi = rm.group(1), int(rm.group(2)), int(rm.group(3))
+                        per_app_ranges.setdefault(app_name, []).append((proto, lo, hi))
+                    else:
+                        per_app.setdefault(app_name, set()).add(port_spec)
             else:
                 global_ports.add(s)
     n_global  = len(global_ports)
     n_per_app = sum(len(v) for v in per_app.values())
-    print(f"  Loaded {n_global + n_per_app} entries from {path.name}"
-          f" ({n_global} global, {n_per_app} per-app)")
-    return global_ports, per_app
+    n_ranges  = sum(len(v) for v in per_app_ranges.values())
+    print(f"  Loaded {n_global + n_per_app + n_ranges} entries from {path.name}"
+          f" ({n_global} global, {n_per_app} per-app, {n_ranges} per-app range(s))")
+    return global_ports, per_app, per_app_ranges
 
 
 # ── PCI detection ────────────────────────────────────────────────────────────
@@ -843,10 +866,11 @@ def format_unknown_rule_design(
     device_group:   str,
     run_month_year: str,
     has_known_apps: bool,
+    base_tags:      list[str],
 ) -> str:
     new_rule_name = f"APP-ID-{rule_name}-UNKNOWN" if has_known_apps else f"APP-ID-{rule_name}"
 
-    tags = [t for t in config.existing_tags if t not in (TAG_UNUSED, TAG_UNDER_REVIEW)] + [TAG_NEW_RULE, TAG_UNKNOWN]
+    tags = list(base_tags) + [TAG_NEW_RULE, TAG_UNKNOWN]
 
     ports = [p.strip() for p in ports_raw.split("|") if p.strip()]
     service = ", ".join(ports) if ports and ports != ["application-default"] else "application-default"
@@ -1009,9 +1033,10 @@ def format_nonstandard_rule_design(
     service:        str,
     device_group:   str,
     run_month_year: str,
+    base_tags:      list[str],
     rule_suffix:    str = "-NS",
 ) -> str:
-    tags = [t for t in config.existing_tags if t not in (TAG_UNUSED, TAG_UNDER_REVIEW)] + [TAG_NEW_RULE, TAG_NON_STANDARD]
+    tags = list(base_tags) + [TAG_NEW_RULE, TAG_NON_STANDARD]
 
     lines = [f"Design {design_number}", ""]
     lines += [
@@ -1047,8 +1072,9 @@ def format_risky_rule_design(
     risky_apps:     list[str],
     device_group:   str,
     run_month_year: str,
+    base_tags:      list[str],
 ) -> str:
-    tags = [t for t in config.existing_tags if t not in (TAG_UNUSED, TAG_UNDER_REVIEW)] + [TAG_NEW_RULE, TAG_RISKY]
+    tags = list(base_tags) + [TAG_NEW_RULE, TAG_RISKY]
 
     lines = [f"Design {design_number}", ""]
     lines += [
@@ -1226,6 +1252,12 @@ def main() -> None:
              f" omit file to disable per-app splitting)",
     )
     parser.add_argument(
+        "--exclude-tags", metavar="FILE", dest="exclude_tags_file",
+        help=f"File listing tag names to strip from new APP-ID-* rule designs"
+             f" (default: {EXCLUDE_NEW_RULE_TAGS_FILE.name} in script directory;"
+             f" omit file to use only the built-in exclusions)",
+    )
+    parser.add_argument(
         "--no-csv", action="store_true",
         help="Skip the structured CSV output; generate text design file only",
     )
@@ -1293,11 +1325,18 @@ def main() -> None:
     ns_split_apps: set[str] = set()
     if nsa_path.exists():
         ns_split_apps = load_set_from_file(nsa_path, default=frozenset(), label="ns-split-apps")
+
+    et_path = Path(args.exclude_tags_file) if args.exclude_tags_file else EXCLUDE_NEW_RULE_TAGS_FILE
+    exclude_new_rule_tags: frozenset[str] = frozenset()
+    if et_path.exists():
+        exclude_new_rule_tags = frozenset(
+            load_set_from_file(et_path, default=frozenset(), label="exclude-new-rule-tags")
+        )
     if pci_tags and not args.no_csv:
         print(f"  PCI csv     : {pci_csv_path}")
 
     sp_path = Path(args.standard_ports_file) if args.standard_ports_file else STANDARD_PORTS_FILE
-    static_standard_ports, per_app_standard_ports = load_standard_ports_file(
+    static_standard_ports, per_app_standard_ports, per_app_port_ranges = load_standard_ports_file(
         sp_path,
         require=args.static_ports,   # warn if missing only when it's the primary reference
         label="standard-ports" if args.static_ports else "standard-ports (supplement)",
@@ -1410,7 +1449,7 @@ def main() -> None:
                 print(f"{n_with_ports}/{len(all_usable)} apps have defined standard ports")
             else:
                 print("API unavailable — falling back to standard-ports.txt")
-                static_standard_ports, per_app_standard_ports = load_standard_ports_file(
+                static_standard_ports, per_app_standard_ports, per_app_port_ranges = load_standard_ports_file(
                     sp_path, require=True, label="standard-ports"
                 )
 
@@ -1472,7 +1511,8 @@ def main() -> None:
         ports_raw    = row.get("ports", "").strip()
         app_port_raw = row.get("app_port_details", "").strip()
         config             = configs[rule_name]
-        base_existing_tags = [t for t in config.existing_tags if t not in (TAG_UNUSED, TAG_UNDER_REVIEW)]
+        _tag_exclude = {TAG_UNUSED, TAG_UNDER_REVIEW} | exclude_new_rule_tags
+        base_existing_tags = [t for t in config.existing_tags if t not in _tag_exclude]
         pci                = is_pci_rule(config, pci_tags)
 
         usable_apps, unknown_apps, has_risky = classify_apps(apps_raw, risky_apps)
@@ -1507,8 +1547,11 @@ def main() -> None:
                     unknown_std_apps.append(app)
                 # Supplement with observed ports that appear in the standard-ports floor.
                 # Global entries apply to any app; per-app entries apply only to this app.
-                supplement  = static_standard_ports | per_app_standard_ports.get(app, set())
-                app_std_eff = app_std | (obs_for_app & supplement)
+                # Per-app ranges (e.g. tcp-49152-65535) cover dynamic port allocations.
+                supplement   = static_standard_ports | per_app_standard_ports.get(app, set())
+                app_ranges   = per_app_port_ranges.get(app, [])
+                range_cover  = {p for p in obs_for_app if _port_in_ranges(p, app_ranges)}
+                app_std_eff  = app_std | (obs_for_app & supplement) | range_cover
                 # Only flag non-standard when we have a reference set to compare against.
                 app_nonst   = (obs_for_app - app_std_eff) if app_std_eff else set()
                 if app_nonst:
@@ -1833,6 +1876,7 @@ def main() -> None:
                 device_group   = device_group,
                 run_month_year = run_month_year,
                 has_known_apps = bool(main_apps),
+                base_tags      = base_existing_tags,
             ))
 
         if generate_nonstandard:
@@ -1848,6 +1892,7 @@ def main() -> None:
                 service        = _ns_svc,
                 device_group   = device_group,
                 run_month_year = run_month_year,
+                base_tags      = base_existing_tags,
             ))
         elif nonstandard_upd_num is not None:
             _upd_designs.append(format_app_update_design(
@@ -1871,6 +1916,7 @@ def main() -> None:
                 service        = _sn_svc,
                 device_group   = device_group,
                 run_month_year = run_month_year,
+                base_tags      = base_existing_tags,
                 rule_suffix    = f"-NS-{sn_app}",
             ))
 
@@ -1882,6 +1928,7 @@ def main() -> None:
                 risky_apps     = risky_app_list,
                 device_group   = device_group,
                 run_month_year = run_month_year,
+                base_tags      = base_existing_tags,
             ))
 
         if TAG_UNDER_REVIEW not in config.existing_tags:
