@@ -131,7 +131,7 @@ requests.packages.urllib3.disable_warnings()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-__version__ = "1.11.14"
+__version__ = "1.11.15"
 
 APP_REVIEW_THRESHOLD     = 10  # flag designs with this many or more usable apps
 APP_FETCH_BATCH          = 50  # max apps per XPath filter to avoid PAN-OS XPath length limits
@@ -364,9 +364,12 @@ def fetch_full_rule_configs(rule_names: list[str]) -> dict[str, RuleConfig]:
 def _parse_app_ports_to_set(entry: ET.Element) -> set[str]:
     """
     Extract default ports from a PAN-OS app entry element.
-    Handles two member formats:
-      'tcp/80'  → tcp-80  (proto/port, existing format)
-      '80'      → tcp-80 and udp-80  (bare number; assumes both protocols)
+    Handles the following member formats:
+      'tcp/80'       → tcp-80
+      'udp/443-445'  → udp-443, udp-444, udp-445  (range with protocol)
+      '80'           → tcp-80, udp-80  (bare number; assumes both protocols)
+      '443,80,udp'   → udp-443, udp-80  (comma-separated ports + protocol name)
+      'udp'          → skipped  (protocol-only, no port enumerable)
     Expands ranges up to MAX_RANGE_EXPAND ports; wider ranges are skipped.
     """
     result: set[str] = set()
@@ -377,26 +380,48 @@ def _parse_app_ports_to_set(entry: ET.Element) -> set[str]:
     if port_el is None:
         return result
 
+    _PROTOS = ("tcp", "udp")
+
+    def _add_port_spec(proto: str, spec: str) -> None:
+        if "-" in spec:
+            try:
+                start_n, end_n = (int(x) for x in spec.split("-", 1))
+                if end_n - start_n <= MAX_RANGE_EXPAND:
+                    for p in range(start_n, end_n + 1):
+                        result.add(f"{proto}-{p}")
+            except ValueError:
+                pass
+        else:
+            try:
+                int(spec)
+                result.add(f"{proto}-{spec}")
+            except ValueError:
+                pass
+
     for member in port_el.findall("member"):
         if not member.text:
             continue
         text = member.text.strip().lower()
-        if "/" in text:
+
+        if "," in text:
+            # Comma-separated list of port numbers / ranges / protocol names.
+            # e.g. "443,80,udp"  →  protos=["udp"], ports=["443","80"]
+            tokens = [t.strip() for t in text.split(",") if t.strip()]
+            protos = [t for t in tokens if t in _PROTOS]
+            port_tokens = [t for t in tokens if t not in _PROTOS]
+            if not protos:
+                protos = list(_PROTOS)
+            for pt in port_tokens:
+                for proto in protos:
+                    _add_port_spec(proto, pt)
+        elif "/" in text:
+            # proto/port or proto/start-end
             proto, port_spec = text.split("/", 1)
-            if "-" in port_spec:
-                try:
-                    start_n, end_n = (int(x) for x in port_spec.split("-", 1))
-                    if end_n - start_n <= MAX_RANGE_EXPAND:
-                        for p in range(start_n, end_n + 1):
-                            result.add(f"{proto}-{p}")
-                except ValueError:
-                    pass
-            else:
-                try:
-                    int(port_spec)
-                    result.add(f"{proto}-{port_spec}")
-                except ValueError:
-                    pass
+            if proto in _PROTOS:
+                _add_port_spec(proto, port_spec)
+        elif text in _PROTOS:
+            # Bare protocol name with no port — can't enumerate, skip.
+            pass
         elif "-" in text:
             # Bare range without protocol — add both tcp and udp
             try:
