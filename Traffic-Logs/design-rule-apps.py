@@ -127,7 +127,7 @@ requests.packages.urllib3.disable_warnings()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-__version__ = "1.11.9"
+__version__ = "1.11.11"
 
 APP_REVIEW_THRESHOLD     = 10  # flag designs with this many or more usable apps
 APP_FETCH_BATCH          = 50  # max apps per XPath filter to avoid PAN-OS XPath length limits
@@ -846,7 +846,7 @@ def format_unknown_rule_design(
 ) -> str:
     new_rule_name = f"APP-ID-{rule_name}-UNKNOWN" if has_known_apps else f"APP-ID-{rule_name}"
 
-    tags = list(config.existing_tags) + [TAG_NEW_RULE, TAG_UNKNOWN]
+    tags = [t for t in config.existing_tags if t != TAG_UNUSED] + [TAG_NEW_RULE, TAG_UNKNOWN]
 
     ports = [p.strip() for p in ports_raw.split("|") if p.strip()]
     service = ", ".join(ports) if ports and ports != ["application-default"] else "application-default"
@@ -1011,7 +1011,7 @@ def format_nonstandard_rule_design(
     run_month_year: str,
     rule_suffix:    str = "-NS",
 ) -> str:
-    tags = list(config.existing_tags) + [TAG_NEW_RULE, TAG_NON_STANDARD]
+    tags = [t for t in config.existing_tags if t != TAG_UNUSED] + [TAG_NEW_RULE, TAG_NON_STANDARD]
 
     lines = [f"Design {design_number}", ""]
     lines += [
@@ -1048,7 +1048,7 @@ def format_risky_rule_design(
     device_group:   str,
     run_month_year: str,
 ) -> str:
-    tags = list(config.existing_tags) + [TAG_NEW_RULE, TAG_RISKY]
+    tags = [t for t in config.existing_tags if t != TAG_UNUSED] + [TAG_NEW_RULE, TAG_RISKY]
 
     lines = [f"Design {design_number}", ""]
     lines += [
@@ -1374,6 +1374,16 @@ def main() -> None:
         print(f"  {existing_app_ids} rules have an existing APP-ID rule")
         sys.exit(0)
 
+    # ── Filter out rules not found in Panorama ───────────────────────────────
+    # Rules that were disabled or deleted between scan runs must not generate
+    # designs. Filter before app-port lookups so they are excluded everywhere.
+    missing_rules = [n for n in rule_names if not configs[n].found]
+    if missing_rules:
+        print(f"  Skipping {len(missing_rules)} rule(s) not found in Panorama"
+              f" (disabled or removed): {', '.join(missing_rules)}")
+        rows       = [r for r in rows if r.get("rule") and configs[r["rule"]].found]
+        rule_names = [r["rule"] for r in rows if r.get("rule")]
+
     # ── App default port lookup ───────────────────────────────────────────────
     # app_port_map: app_name → set of 'tcp-80' style standard port strings
     # dynamic_available: True  → use per-rule union of app default ports
@@ -1461,8 +1471,9 @@ def main() -> None:
         apps_raw     = row.get("apps", "").strip()
         ports_raw    = row.get("ports", "").strip()
         app_port_raw = row.get("app_port_details", "").strip()
-        config       = configs[rule_name]
-        pci          = is_pci_rule(config, pci_tags)
+        config             = configs[rule_name]
+        base_existing_tags = [t for t in config.existing_tags if t != TAG_UNUSED]
+        pci                = is_pci_rule(config, pci_tags)
 
         usable_apps, unknown_apps, has_risky = classify_apps(apps_raw, risky_apps)
         risky_app_list = [a for a in usable_apps if a.lower() in risky_apps]
@@ -1523,19 +1534,21 @@ def main() -> None:
             continue
 
         if complete == "skipped" or has_no_apps:
-            if pci:
-                pci_design_count += 1
-                _dnum = f"PCI-{pci_design_count}"
-                pci_update_count += 1
-                update_designs_pci.append(format_unused_design(_dnum, rule_name, device_group, run_month_year))
-                if not args.no_csv:
-                    csv_rows_pci.append(build_tag_update_row(rule_name, TAG_UNUSED, device_group))
-            else:
-                design_count += 1
-                unused_count += 1
-                update_designs.append(format_unused_design(design_count, rule_name, device_group, run_month_year))
-                if not args.no_csv:
-                    csv_rows.append(build_tag_update_row(rule_name, TAG_UNUSED, device_group))
+            app_id_deployed = configs[f"APP-ID-{rule_name}"].found
+            if TAG_UNUSED not in config.existing_tags and not app_id_deployed:
+                if pci:
+                    pci_design_count += 1
+                    _dnum = f"PCI-{pci_design_count}"
+                    pci_update_count += 1
+                    update_designs_pci.append(format_unused_design(_dnum, rule_name, device_group, run_month_year))
+                    if not args.no_csv:
+                        csv_rows_pci.append(build_tag_update_row(rule_name, TAG_UNUSED, device_group))
+                else:
+                    design_count += 1
+                    unused_count += 1
+                    update_designs.append(format_unused_design(design_count, rule_name, device_group, run_month_year))
+                    if not args.no_csv:
+                        csv_rows.append(build_tag_update_row(rule_name, TAG_UNUSED, device_group))
             continue
 
         # ── Port filtering and service determination for main rule ────────────
@@ -1576,7 +1589,7 @@ def main() -> None:
             service, _ = determine_port_setting(effective_ports_raw, rule_std_ports)
 
         # Main rule never gets TAG_NON_STANDARD or TAG_RISKY — those go to their own rules
-        new_rule_tags: list[str] = list(config.existing_tags) + [TAG_NEW_RULE]
+        new_rule_tags: list[str] = list(base_existing_tags) + [TAG_NEW_RULE]
 
         # ── Partition per-app NS splits ───────────────────────────────────────
         split_ns_designs: list[tuple[str, set[str]]] = []  # (app_name, ns_ports)
@@ -1871,7 +1884,8 @@ def main() -> None:
                 run_month_year = run_month_year,
             ))
 
-        _upd_designs.append(format_rule_update(update_num, rule_name, TAG_UNDER_REVIEW, device_group, run_month_year))
+        if TAG_UNDER_REVIEW not in config.existing_tags:
+            _upd_designs.append(format_rule_update(update_num, rule_name, TAG_UNDER_REVIEW, device_group, run_month_year))
 
         # ── CSV rows ──────────────────────────────────────────────────────────
         if not args.no_csv:
@@ -1892,7 +1906,7 @@ def main() -> None:
 
             if generate_unknown:
                 unknown_csv_name = f"APP-ID-{rule_name}-UNKNOWN" if main_apps else f"APP-ID-{rule_name}"
-                unknown_tags = list(config.existing_tags) + [TAG_NEW_RULE, TAG_UNKNOWN]
+                unknown_tags = list(base_existing_tags) + [TAG_NEW_RULE, TAG_UNKNOWN]
                 non_any_users = [u for u in config.source_users if u.lower() != "any"]
                 u_ports = [p.strip() for p in (effective_ports_raw or "").split("|") if p.strip()]
                 unknown_service = (" | ".join(u_ports)
@@ -1918,7 +1932,7 @@ def main() -> None:
                 })
 
             if generate_nonstandard:
-                nonst_tags = list(config.existing_tags) + [TAG_NEW_RULE, TAG_NON_STANDARD]
+                nonst_tags = list(base_existing_tags) + [TAG_NEW_RULE, TAG_NON_STANDARD]
                 non_any_users = [u for u in config.source_users if u.lower() != "any"]
                 _csv.append({
                     "type":             "new_rule",
@@ -1945,7 +1959,7 @@ def main() -> None:
                 _sn_svc_c, _ = consolidate_ns_service(
                     sn_ports, ports_raw, svc_port_map, svc_group_map
                 )
-                sn_tags = list(config.existing_tags) + [TAG_NEW_RULE, TAG_NON_STANDARD]
+                sn_tags = list(base_existing_tags) + [TAG_NEW_RULE, TAG_NON_STANDARD]
                 non_any_users = [u for u in config.source_users if u.lower() != "any"]
                 _csv.append({
                     "type":             "new_rule",
@@ -1967,7 +1981,7 @@ def main() -> None:
                 })
 
             if generate_risky:
-                risky_tags = list(config.existing_tags) + [TAG_NEW_RULE, TAG_RISKY]
+                risky_tags = list(base_existing_tags) + [TAG_NEW_RULE, TAG_RISKY]
                 non_any_users = [u for u in config.source_users if u.lower() != "any"]
                 _csv.append({
                     "type":             "new_rule",
@@ -1988,15 +2002,19 @@ def main() -> None:
                     "tags_to_add":      "",
                 })
 
-            _csv.append(build_tag_update_row(rule_name, TAG_UNDER_REVIEW, device_group))
+            if TAG_UNDER_REVIEW not in config.existing_tags:
+                _csv.append(build_tag_update_row(rule_name, TAG_UNDER_REVIEW, device_group))
 
-    SEP = "=" * 62
+    SEP  = "=" * 62
+    HSEP = "=" * 78
+
+    def _section_header(title: str) -> str:
+        return f"{HSEP}\n{HSEP}\n  {title}\n{HSEP}"
 
     total_new     = new_rule_count + unknown_rule_count + nonstandard_rule_count + risky_rule_count
     total_designs = design_count + pci_design_count
     summary_lines = [
-        "SUMMARY",
-        SEP,
+        _section_header("SUMMARY"),
         f"Generated   : {run_dt.strftime('%Y-%m-%d %H:%M:%S')}",
         f"Script      : design-rule-apps.py v{__version__}",
         f"Device group: {device_group}",
@@ -2026,7 +2044,7 @@ def main() -> None:
     preamble = ["\n".join(summary_lines)]
 
     if missing_svc_groups:
-        msg_lines = ["MISSING SERVICE GROUPS", SEP, "",
+        msg_lines = [_section_header("MISSING SERVICE GROUPS"), "",
                      "The following service groups are referenced in NS rule designs",
                      "but were not found in Panorama.  Create them before deploying:",
                      ""]
@@ -2036,21 +2054,21 @@ def main() -> None:
 
     if notes:
         pad = max(len(p) for p, _ in notes)
-        note_lines = ["NOTES", SEP, ""]
+        note_lines = [_section_header("NOTES"), ""]
         for prefix, message in notes:
             note_lines.append(f"{prefix.ljust(pad)}: {message}")
         preamble.append("\n".join(note_lines))
 
     sections = []
     if new_rule_designs:
-        sections.append(f"NEW RULES\n{SEP}\n\n" + "\n\n---\n\n".join(new_rule_designs))
+        sections.append(_section_header("NEW RULES") + "\n\n" + "\n\n---\n\n".join(new_rule_designs))
     if update_designs:
-        sections.append(f"RULE UPDATES\n{SEP}\n\n" + "\n\n---\n\n".join(update_designs))
+        sections.append(_section_header("RULE UPDATES") + "\n\n" + "\n\n---\n\n".join(update_designs))
     if new_rule_designs_pci:
-        sections.append(f"PCI — NEW RULES\n{SEP}\n\n" + "\n\n---\n\n".join(new_rule_designs_pci))
+        sections.append(_section_header("PCI — NEW RULES") + "\n\n" + "\n\n---\n\n".join(new_rule_designs_pci))
     if update_designs_pci:
-        sections.append(f"PCI — RULE UPDATES\n{SEP}\n\n" + "\n\n---\n\n".join(update_designs_pci))
-    text_output = "\n\n\n".join(preamble + sections)
+        sections.append(_section_header("PCI — RULE UPDATES") + "\n\n" + "\n\n---\n\n".join(update_designs_pci))
+    text_output = "\n\n\n\n".join(preamble + sections)
 
     with open(txt_path, "w", encoding="utf-8") as fh:
         fh.write(text_output + "\n")
