@@ -131,7 +131,7 @@ requests.packages.urllib3.disable_warnings()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-__version__ = "1.11.15"
+__version__ = "1.11.16"
 
 APP_REVIEW_THRESHOLD     = 10  # flag designs with this many or more usable apps
 APP_FETCH_BATCH          = 50  # max apps per XPath filter to avoid PAN-OS XPath length limits
@@ -193,6 +193,8 @@ DESIGN_CSV_FIELDNAMES = [
     "tags_to_add",
 ]
 
+SVC_CSV_FIELDNAMES = ["type", "name", "device_group", "protocol", "port"]
+
 # ── Data classes ──────────────────────────────────────────────────────────────
 
 @dataclass
@@ -234,7 +236,8 @@ def load_set_from_file(
     return result
 
 
-_RANGE_RE = re.compile(r'^(tcp|udp)-(\d+)-(\d+)$')
+_RANGE_RE           = re.compile(r'^(tcp|udp)-(\d+)-(\d+)$')
+_RAW_SINGLE_PORT_RE = re.compile(r'^(tcp|udp)-(\d+)$')
 
 def _port_in_ranges(port_spec: str, ranges: list[tuple[str, int, int]]) -> bool:
     """Return True if port_spec (e.g. 'tcp-49200') falls within any of the given ranges."""
@@ -1321,6 +1324,7 @@ def main() -> None:
     txt_path     = f"{output_stem}.txt"
     csv_path     = f"{output_stem}.csv"
     pci_csv_path = f"{output_stem}-pci.csv"
+    svc_csv_path = f"{output_stem}-svc.csv"
 
     port_mode = "static (standard-ports.txt)" if args.static_ports else "dynamic (Panorama app-id database)"
 
@@ -1502,6 +1506,18 @@ def main() -> None:
     svc_group_map = fetch_service_group_map()
     print(f"{len(svc_port_map)} service objects, {len(svc_group_map)} groups")
 
+    # Build inverted coverage set — mirrors deploy-rule-design.py's resolve_service logic.
+    # Used to detect raw port specs in NS service strings with no named service object.
+    _svc_covered: set[str] = set()
+    for _svc_name, _ranges in svc_port_map.items():
+        _svc_covered.add(_svc_name.lower())
+        for _proto, _lo, _hi in _ranges:
+            if _hi - _lo <= 1000:
+                for _p in range(_lo, _hi + 1):
+                    _svc_covered.add(f"{_proto}-{_p}")
+    for _grp_name in svc_group_map:
+        _svc_covered.add(_grp_name.lower())
+
     print()
 
     device_group           = ops_lib.DEVICE_GROUP
@@ -1513,6 +1529,7 @@ def main() -> None:
     csv_rows_pci:         list[dict] = []
     notes: list[str]            = []
     missing_svc_groups: set[str] = set()
+    missing_svc_objects: dict[str, tuple[str, str]] = {}  # name → (protocol, port_spec)
     design_count               = 0
     new_rule_count             = 0
     unknown_rule_count         = 0
@@ -1909,6 +1926,11 @@ def main() -> None:
                 nonst_ports, ports_raw, svc_port_map, svc_group_map
             )
             missing_svc_groups |= _ns_missing
+            for _tok in _ns_svc.split(" | "):
+                _tok = _tok.strip()
+                _m = _RAW_SINGLE_PORT_RE.match(_tok)
+                if _m and _tok.lower() not in _svc_covered:
+                    missing_svc_objects[_tok] = (_m.group(1), _m.group(2))
             _new_designs.append(format_nonstandard_rule_design(
                 design_number  = nonstandard_num,
                 rule_name      = rule_name,
@@ -1933,6 +1955,11 @@ def main() -> None:
                 sn_ports, ports_raw, svc_port_map, svc_group_map
             )
             missing_svc_groups |= _sn_missing
+            for _tok in _sn_svc.split(" | "):
+                _tok = _tok.strip()
+                _m = _RAW_SINGLE_PORT_RE.match(_tok)
+                if _m and _tok.lower() not in _svc_covered:
+                    missing_svc_objects[_tok] = (_m.group(1), _m.group(2))
             _new_designs.append(format_nonstandard_rule_design(
                 design_number  = sn_num,
                 rule_name      = rule_name,
@@ -2115,13 +2142,22 @@ def main() -> None:
         )
     preamble = ["\n".join(summary_lines)]
 
-    if missing_svc_groups:
-        msg_lines = [_section_header("MISSING SERVICE GROUPS"), "",
-                     "The following service groups are referenced in NS rule designs",
-                     "but were not found in Panorama.  Create them before deploying:",
+    # Fold missing ephemeral groups into missing_svc_objects for unified CSV output.
+    for _grp in missing_svc_groups:
+        _rm = _RANGE_RE.match(_grp)
+        if _rm:
+            missing_svc_objects[_grp] = (_rm.group(1), f"{_rm.group(2)}-{_rm.group(3)}")
+
+    if missing_svc_objects:
+        msg_lines = [_section_header("MISSING SERVICE OBJECTS"), "",
+                     "The following service objects are referenced in NS rule designs",
+                     "but were not found in Panorama.  Run deploy-service-objects.py",
+                     f"with the -svc.csv file below before deploying rules:",
+                     f"  {svc_csv_path}",
                      ""]
-        for grp in sorted(missing_svc_groups):
-            msg_lines.append(f"  {grp}")
+        for obj in sorted(missing_svc_objects):
+            proto, port = missing_svc_objects[obj]
+            msg_lines.append(f"  {obj}  ({proto}/{port})")
         preamble.append("\n".join(msg_lines))
 
     if notes:
@@ -2157,6 +2193,20 @@ def main() -> None:
             writer.writeheader()
             writer.writerows(csv_rows_pci)
 
+    if missing_svc_objects:
+        with open(svc_csv_path, "w", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=SVC_CSV_FIELDNAMES)
+            writer.writeheader()
+            for _name in sorted(missing_svc_objects):
+                _proto, _port = missing_svc_objects[_name]
+                writer.writerow({
+                    "type":         "service_object",
+                    "name":         _name,
+                    "device_group": device_group,
+                    "protocol":     _proto,
+                    "port":         _port,
+                })
+
     print("=" * 62)
     print(f"  {total_designs} design(s) total")
     print(f"  {total_new} new rule(s) ({nonstandard_rule_count} NS, {risky_rule_count} RISKY)"
@@ -2174,6 +2224,8 @@ def main() -> None:
         print(f"  CSV  : {csv_path}")
         if pci_tags and csv_rows_pci:
             print(f"  CSV (PCI) : {pci_csv_path}")
+    if missing_svc_objects:
+        print(f"  CSV (svc) : {svc_csv_path}  ← deploy service objects first")
     print("=" * 62)
 
 
