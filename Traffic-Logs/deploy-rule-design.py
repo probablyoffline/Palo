@@ -59,7 +59,7 @@ import ops_lib  # noqa: E402
 
 requests.packages.urllib3.disable_warnings()
 
-__version__ = "1.2.5"
+__version__ = "1.2.6"
 
 # Matches design-rule-apps.py — ranges wider than this are not expanded for port lookup
 MAX_RANGE_EXPAND = 1000
@@ -201,6 +201,9 @@ def fetch_service_objects() -> dict[str, str]:
             if udp_el is not None and udp_el.text:
                 for key in _expand_port_spec("udp", udp_el.text):
                     port_to_name[key] = name
+            # Index by name directly so wide-range objects (> MAX_RANGE_EXPAND)
+            # that are skipped by _expand_port_spec are still resolvable by name.
+            port_to_name[name.lower()] = name
 
     return port_to_name
 
