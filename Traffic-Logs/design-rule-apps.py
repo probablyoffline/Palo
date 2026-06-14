@@ -127,7 +127,7 @@ requests.packages.urllib3.disable_warnings()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-__version__ = "1.11.11"
+__version__ = "1.11.12"
 
 APP_REVIEW_THRESHOLD     = 10  # flag designs with this many or more usable apps
 APP_FETCH_BATCH          = 50  # max apps per XPath filter to avoid PAN-OS XPath length limits
@@ -846,7 +846,7 @@ def format_unknown_rule_design(
 ) -> str:
     new_rule_name = f"APP-ID-{rule_name}-UNKNOWN" if has_known_apps else f"APP-ID-{rule_name}"
 
-    tags = [t for t in config.existing_tags if t != TAG_UNUSED] + [TAG_NEW_RULE, TAG_UNKNOWN]
+    tags = [t for t in config.existing_tags if t not in (TAG_UNUSED, TAG_UNDER_REVIEW)] + [TAG_NEW_RULE, TAG_UNKNOWN]
 
     ports = [p.strip() for p in ports_raw.split("|") if p.strip()]
     service = ", ".join(ports) if ports and ports != ["application-default"] else "application-default"
@@ -1011,7 +1011,7 @@ def format_nonstandard_rule_design(
     run_month_year: str,
     rule_suffix:    str = "-NS",
 ) -> str:
-    tags = [t for t in config.existing_tags if t != TAG_UNUSED] + [TAG_NEW_RULE, TAG_NON_STANDARD]
+    tags = [t for t in config.existing_tags if t not in (TAG_UNUSED, TAG_UNDER_REVIEW)] + [TAG_NEW_RULE, TAG_NON_STANDARD]
 
     lines = [f"Design {design_number}", ""]
     lines += [
@@ -1048,7 +1048,7 @@ def format_risky_rule_design(
     device_group:   str,
     run_month_year: str,
 ) -> str:
-    tags = [t for t in config.existing_tags if t != TAG_UNUSED] + [TAG_NEW_RULE, TAG_RISKY]
+    tags = [t for t in config.existing_tags if t not in (TAG_UNUSED, TAG_UNDER_REVIEW)] + [TAG_NEW_RULE, TAG_RISKY]
 
     lines = [f"Design {design_number}", ""]
     lines += [
@@ -1472,7 +1472,7 @@ def main() -> None:
         ports_raw    = row.get("ports", "").strip()
         app_port_raw = row.get("app_port_details", "").strip()
         config             = configs[rule_name]
-        base_existing_tags = [t for t in config.existing_tags if t != TAG_UNUSED]
+        base_existing_tags = [t for t in config.existing_tags if t not in (TAG_UNUSED, TAG_UNDER_REVIEW)]
         pci                = is_pci_rule(config, pci_tags)
 
         usable_apps, unknown_apps, has_risky = classify_apps(apps_raw, risky_apps)
