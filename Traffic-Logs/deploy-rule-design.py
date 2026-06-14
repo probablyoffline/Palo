@@ -59,7 +59,7 @@ import ops_lib  # noqa: E402
 
 requests.packages.urllib3.disable_warnings()
 
-__version__ = "1.2.6"
+__version__ = "1.2.7"
 
 # Matches design-rule-apps.py — ranges wider than this are not expanded for port lookup
 MAX_RANGE_EXPAND = 1000
@@ -163,6 +163,7 @@ def fetch_service_objects() -> dict[str, str]:
     port_to_name: dict[str, str] = {}
 
     sources: list[str] = ["/config/predefined/service"]
+    group_sources: list[str] = []
     if ops_lib.MODE == "panorama":
         sources.append("/config/shared/service")
         sources.append(
@@ -173,11 +174,22 @@ def fetch_service_objects() -> dict[str, str]:
             f"/config/devices/entry[@name='localhost.localdomain']"
             f"/device-group/entry[@name='{ops_lib.DEVICE_GROUP}']/service"
         )
+        group_sources = [
+            "/config/shared/service-group",
+            "/config/devices/entry[@name='localhost.localdomain']"
+            "/device-group/entry/service-group",
+            f"/config/devices/entry[@name='localhost.localdomain']"
+            f"/device-group/entry[@name='{ops_lib.DEVICE_GROUP}']/service-group",
+        ]
     else:
         sources.append(
             f"/config/devices/entry[@name='localhost.localdomain']"
             f"/vsys/entry[@name='{ops_lib.VSYS}']/service"
         )
+        group_sources = [
+            f"/config/devices/entry[@name='localhost.localdomain']"
+            f"/vsys/entry[@name='{ops_lib.VSYS}']/service-group",
+        ]
 
     for xpath in sources:
         try:
@@ -204,6 +216,20 @@ def fetch_service_objects() -> dict[str, str]:
             # Index by name directly so wide-range objects (> MAX_RANGE_EXPAND)
             # that are skipped by _expand_port_spec are still resolvable by name.
             port_to_name[name.lower()] = name
+
+    # Fetch service groups — index by name only (no port expansion needed).
+    for xpath in group_sources:
+        try:
+            xml_text = ops_lib.api_get(xpath)
+            root     = ET.fromstring(xml_text)
+        except Exception:
+            continue
+        if root.get("status") == "error":
+            continue
+        for entry in root.iter("entry"):
+            name = entry.get("name", "")
+            if name:
+                port_to_name[name.lower()] = name
 
     return port_to_name
 
