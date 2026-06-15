@@ -131,7 +131,7 @@ requests.packages.urllib3.disable_warnings()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-__version__ = "1.11.17"
+__version__ = "1.11.18"
 
 APP_REVIEW_THRESHOLD     = 10  # flag designs with this many or more usable apps
 APP_FETCH_BATCH          = 50  # max apps per XPath filter to avoid PAN-OS XPath length limits
@@ -155,6 +155,11 @@ TAG_UNKNOWN         = "app-id-unknown"
 TAG_RISKY           = "risky-app"
 TAG_UNDER_REVIEW    = "app-id-under-review"
 TAG_UNUSED          = "app-id-review-unused"
+
+NOTE_CAT_CONFIG    = "Configuration"
+NOTE_CAT_EXISTING  = "Existing rules"
+NOTE_CAT_GENERATED = "New designs"
+NOTE_CAT_REVIEW    = "Investigation / review"
 
 EPHEMERAL_THRESHOLD = 10          # min total remaining ports before substituting a group
 NS_SPLIT_THRESHOLD  = 10          # min per-app NS ports to trigger a split rule
@@ -1527,7 +1532,7 @@ def main() -> None:
     new_rule_designs_pci: list[str] = []
     update_designs_pci:   list[str] = []
     csv_rows_pci:         list[dict] = []
-    notes: list[str]            = []
+    notes: list[tuple[str, str, str]] = []               # (prefix, message, category)
     missing_svc_groups: set[str] = set()
     missing_svc_objects: dict[str, tuple[str, str]] = {}  # name → (protocol, port_spec)
     missing_svc_rules: dict[str, set[str]] = {}           # name → set of rule names
@@ -1787,12 +1792,14 @@ def main() -> None:
             notes.append((
                 f"Design {first_num} — {rule_name}",
                 "rule was not found in Panorama config — zone, address, and profile fields are empty.",
+                NOTE_CAT_CONFIG,
             ))
         if has_named_service:
             notes.append((
                 f"Design {first_num} — {rule_name}",
                 f"service config contains named objects/groups — application-default used. "
                 f"Original service: {ports_raw}",
+                NOTE_CAT_CONFIG,
             ))
         if unknown_std_apps:
             notes.append((
@@ -1800,6 +1807,7 @@ def main() -> None:
                 f"standard ports not found in Panorama app-id database for: "
                 f"{', '.join(unknown_std_apps)} — observed ports treated as standard. "
                 f"Verify manually or check Panorama connectivity.",
+                NOTE_CAT_CONFIG,
             ))
         dropped: list[str] = []
         if not has_named_service and dynamic_available and valid_configured:
@@ -1808,33 +1816,39 @@ def main() -> None:
             notes.append((
                 f"Design {first_num} — {rule_name}",
                 f"ports dropped from main rule: {', '.join(dropped)}",
+                NOTE_CAT_CONFIG,
             ))
         if known_exists and main_apps:
             if args.update_existing:
                 notes.append((
                     f"Design {app_update_num} — {rule_name}",
                     f"APP-ID-{rule_name} already exists — app_update design generated to add/confirm apps.",
+                    NOTE_CAT_EXISTING,
                 ))
             else:
                 notes.append((
                     f"Design {update_num} — {rule_name}",
                     f"APP-ID-{rule_name} already exists — new rule design skipped. Use --update-existing to generate an app_update.",
+                    NOTE_CAT_EXISTING,
                 ))
         if unknown_exists and unknown_apps:
             notes.append((
                 f"Design {update_num} — {rule_name}",
                 f"APP-ID-{rule_name}-UNKNOWN already exists — unknown-traffic rule design skipped.",
+                NOTE_CAT_EXISTING,
             ))
         if nonstandard_exists and nonst_apps and nonst_ports:
             if args.update_existing:
                 notes.append((
                     f"Design {nonstandard_upd_num} — {rule_name}",
                     f"APP-ID-{rule_name}-NS already exists — app_update design generated.",
+                    NOTE_CAT_EXISTING,
                 ))
             else:
                 notes.append((
                     f"Design {update_num} — {rule_name}",
                     f"APP-ID-{rule_name}-NS already exists — skipped. Use --update-existing to add new apps.",
+                    NOTE_CAT_EXISTING,
                 ))
         if generate_nonstandard:
             ns_detail = (f"{len(nonst_ports)}+ ports" if len(nonst_ports) > 10
@@ -1843,6 +1857,7 @@ def main() -> None:
                 f"Design {nonstandard_num} — {rule_name}",
                 f"non-standard port traffic detected: {ns_detail} — "
                 f"separate NS rule generated.",
+                NOTE_CAT_GENERATED,
             ))
         for sn_app, sn_ports, sn_num in split_ns_nums:
             sn_detail = (f"{len(sn_ports)}+ ports" if len(sn_ports) > 10
@@ -1851,17 +1866,20 @@ def main() -> None:
                 f"Design {sn_num} — {rule_name}",
                 f"split NS rule for {sn_app}: {sn_detail} — "
                 f"separate NS-{sn_app} rule generated.",
+                NOTE_CAT_GENERATED,
             ))
         if risky_exists and risky_app_list:
             notes.append((
                 f"Design {update_num} — {rule_name}",
                 f"APP-ID-{rule_name}-RISKY already exists — risky-app rule design skipped.",
+                NOTE_CAT_EXISTING,
             ))
         if generate_risky:
             notes.append((
                 f"Design {risky_num} — {rule_name}",
                 f"risky app(s) detected: {', '.join(risky_app_list)} — "
                 f"separate RISKY rule generated.",
+                NOTE_CAT_GENERATED,
             ))
         if generate_unknown:
             has_main_design = generate_known or app_update_num is not None
@@ -1872,6 +1890,7 @@ def main() -> None:
                     f" rule has been generated as Design {unknown_num}. These sessions could not"
                     " be identified by App-ID and require investigation before the old rule can"
                     " be safely retired.",
+                    NOTE_CAT_REVIEW,
                 ))
             else:
                 notes.append((
@@ -1879,11 +1898,13 @@ def main() -> None:
                     "only unknown-tcp/unknown-udp traffic was observed. These sessions could not"
                     " be identified by App-ID and require investigation before the old rule can"
                     " be safely retired.",
+                    NOTE_CAT_REVIEW,
                 ))
         if generate_known and len(main_apps) >= args.app_review_threshold:
             notes.append((
                 f"Design {known_num} — {rule_name}",
                 f"{len(main_apps)} apps — manual review recommended before finalizing this design.",
+                NOTE_CAT_REVIEW,
             ))
 
         # ── Generate design blocks ────────────────────────────────────────────
@@ -2168,10 +2189,24 @@ def main() -> None:
         preamble.append("\n".join(msg_lines))
 
     if notes:
-        pad = max(len(p) for p, _ in notes)
+        _cat_order = [NOTE_CAT_CONFIG, NOTE_CAT_EXISTING, NOTE_CAT_GENERATED, NOTE_CAT_REVIEW]
+        _grouped: dict[str, list[tuple[str, str]]] = {c: [] for c in _cat_order}
+        for _prefix, _message, _cat in notes:
+            _grouped[_cat].append((_prefix, _message))
         note_lines = [_section_header("NOTES"), ""]
-        for prefix, message in notes:
-            note_lines.append(f"{prefix.ljust(pad)}: {message}")
+        _first_cat = True
+        for _cat in _cat_order:
+            _entries = _grouped[_cat]
+            if not _entries:
+                continue
+            if not _first_cat:
+                note_lines.append("")
+            note_lines.append(f"  {_cat}")
+            note_lines.append("  " + "─" * len(_cat))
+            _pad = max(len(p) for p, _ in _entries)
+            for _prefix, _message in _entries:
+                note_lines.append(f"  {_prefix.ljust(_pad)}: {_message}")
+            _first_cat = False
         preamble.append("\n".join(note_lines))
 
     sections = []
