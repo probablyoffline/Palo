@@ -1,0 +1,16 @@
+# exclude-apps.txt
+#
+# Apps listed here are excluded from all rule designs.
+# Their observed ports are also removed, so they don't contribute
+# to NS rules or service object generation.
+#
+# Use this for apps that appear on many ports and would inflate designs
+# (e.g. auto-update clients, noisy background traffic) that you don't
+# want to address yet.
+#
+# App names must match exactly what PAN-OS returns in the traffic log
+# 'app' field (lowercase). Lines starting with # are comments.
+#
+# Example:
+# ms-update
+# apple-update

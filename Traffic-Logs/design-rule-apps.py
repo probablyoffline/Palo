@@ -131,7 +131,7 @@ requests.packages.urllib3.disable_warnings()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-__version__ = "1.11.18"
+__version__ = "1.11.19"
 
 APP_REVIEW_THRESHOLD     = 10  # flag designs with this many or more usable apps
 APP_FETCH_BATCH          = 50  # max apps per XPath filter to avoid PAN-OS XPath length limits
@@ -143,6 +143,7 @@ RISKY_APPS_FILE        = SCRIPT_DIR / "risky-apps.txt"
 PCI_FLAGS_FILE         = SCRIPT_DIR / "flags-pci.txt"
 NS_SPLIT_APPS_FILE     = SCRIPT_DIR / "ns-split-apps.txt"
 EXCLUDE_NEW_RULE_TAGS_FILE = SCRIPT_DIR / "exclude-new-rule-tags.txt"
+EXCLUDE_APPS_FILE          = SCRIPT_DIR / "exclude-apps.txt"
 
 DEFAULT_RISKY_APPS = frozenset({"ssh", "ms-rdp", "telnet", "ftp", "tftp"})
 
@@ -215,6 +216,7 @@ class RuleConfig:
     action:        str       = "allow"
     group_profile: str       = ""
     found:         bool      = True
+    service:       list[str] = field(default_factory=list)
 
 
 # ── Config file loader ────────────────────────────────────────────────────────
@@ -346,6 +348,13 @@ def fetch_full_rule_configs(rule_names: list[str]) -> dict[str, RuleConfig]:
                 if m is not None and m.text:
                     group_profile = m.text
 
+        svc_el = entry.find("service")
+        svc_members: list[str] = []
+        if svc_el is not None:
+            svc_members = [m.text.strip() for m in svc_el.findall("member") if m.text]
+            if not svc_members and svc_el.text and svc_el.text.strip():
+                svc_members = [svc_el.text.strip()]
+
         configs[name] = RuleConfig(
             name          = name,
             source_zones  = members("from"),
@@ -358,6 +367,7 @@ def fetch_full_rule_configs(rule_names: list[str]) -> dict[str, RuleConfig]:
             action        = (entry.findtext("action") or "allow").strip(),
             group_profile = group_profile,
             found         = True,
+            service       = svc_members,
         )
 
     for name in rule_names:
@@ -1291,6 +1301,12 @@ def main() -> None:
              f" omit file to use only the built-in exclusions)",
     )
     parser.add_argument(
+        "--exclude-apps-file", metavar="FILE", dest="exclude_apps_file",
+        help=f"File listing app names to exclude from all designs"
+             f" (default: {EXCLUDE_APPS_FILE.name} in script directory;"
+             f" omit file to exclude no apps)",
+    )
+    parser.add_argument(
         "--no-csv", action="store_true",
         help="Skip the structured CSV output; generate text design file only",
     )
@@ -1366,8 +1382,17 @@ def main() -> None:
         exclude_new_rule_tags = frozenset(
             load_set_from_file(et_path, default=frozenset(), label="exclude-new-rule-tags")
         )
+
+    ea_path = Path(args.exclude_apps_file) if args.exclude_apps_file else EXCLUDE_APPS_FILE
+    exclude_apps: frozenset[str] = frozenset()
+    if ea_path.exists():
+        exclude_apps = frozenset(
+            load_set_from_file(ea_path, default=frozenset(), label="exclude-apps")
+        )
     if pci_tags and not args.no_csv:
         print(f"  PCI csv     : {pci_csv_path}")
+    if exclude_apps:
+        print(f"  Excl apps   : {len(exclude_apps)} app(s) excluded from designs")
 
     sp_path = Path(args.standard_ports_file) if args.standard_ports_file else STANDARD_PORTS_FILE
     static_standard_ports, per_app_standard_ports, per_app_port_ranges = load_standard_ports_file(
@@ -1564,12 +1589,22 @@ def main() -> None:
         pci                = is_pci_rule(config, pci_tags)
 
         usable_apps, unknown_apps, has_risky = classify_apps(apps_raw, risky_apps)
+
+        # ── Exclude apps filter ───────────────────────────────────────────────
+        excluded_seen: set[str] = set()
+        if exclude_apps:
+            excluded_seen = {a for a in usable_apps + list(unknown_apps) if a.lower() in exclude_apps}
+            usable_apps  = [a for a in usable_apps  if a.lower() not in exclude_apps]
+            unknown_apps = [a for a in unknown_apps if a.lower() not in exclude_apps]
+
         risky_app_list = [a for a in usable_apps if a.lower() in risky_apps]
         clean_usable   = [a for a in usable_apps if a.lower() not in risky_apps]
         has_unknown = bool(unknown_apps)
 
         # ── Parse observed port data ──────────────────────────────────────────
         app_port_obs   = parse_app_port_details(app_port_raw)
+        if exclude_apps:
+            app_port_obs = {a: ps for a, ps in app_port_obs.items() if a.lower() not in exclude_apps}
         observed_ports = {p for ps in app_port_obs.values() for p in ps}
 
         # ── Validate configured ports (detect named service objects/groups) ───
@@ -1809,15 +1844,39 @@ def main() -> None:
                 f"Verify manually or check Panorama connectivity.",
                 NOTE_CAT_CONFIG,
             ))
-        dropped: list[str] = []
-        if not has_named_service and dynamic_available and valid_configured:
-            dropped = [p for p in valid_configured if p not in filtered]
-        if dropped:
+        if excluded_seen:
             notes.append((
                 f"Design {first_num} — {rule_name}",
-                f"ports dropped from main rule: {', '.join(dropped)}",
+                f"excluded apps (not in design): {', '.join(sorted(excluded_seen))}",
                 NOTE_CAT_CONFIG,
             ))
+        if known_exists:
+            _deployed_svc = configs[f"APP-ID-{rule_name}"].service
+            _filtered_set = set(filtered)
+            _dropped_main = [s for s in _deployed_svc
+                             if s.lower() not in _filtered_set and s != "application-default"]
+            if _dropped_main:
+                notes.append((
+                    f"Design {app_update_num or update_num} — {rule_name}",
+                    f"ports in deployed APP-ID-{rule_name} not seen in current traffic: "
+                    f"{', '.join(_dropped_main)}",
+                    NOTE_CAT_CONFIG,
+                ))
+        if nonstandard_exists and nonst_ports:
+            _ns_svc_chk, _ = consolidate_ns_service(
+                nonst_ports, ports_raw, svc_port_map, svc_group_map
+            )
+            _ns_tokens = {t.strip().lower() for t in _ns_svc_chk.split(" | ") if t.strip()}
+            _deployed_ns_svc = configs[f"APP-ID-{rule_name}-NS"].service
+            _dropped_ns = [s for s in _deployed_ns_svc
+                           if s.lower() not in _ns_tokens and s != "application-default"]
+            if _dropped_ns:
+                notes.append((
+                    f"Design {nonstandard_upd_num or update_num} — {rule_name}",
+                    f"ports in deployed APP-ID-{rule_name}-NS not seen in current traffic: "
+                    f"{', '.join(_dropped_ns)}",
+                    NOTE_CAT_CONFIG,
+                ))
         if known_exists and main_apps:
             if args.update_existing:
                 notes.append((
