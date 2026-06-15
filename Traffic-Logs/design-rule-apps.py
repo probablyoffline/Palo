@@ -131,7 +131,7 @@ requests.packages.urllib3.disable_warnings()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-__version__ = "1.11.16"
+__version__ = "1.11.17"
 
 APP_REVIEW_THRESHOLD     = 10  # flag designs with this many or more usable apps
 APP_FETCH_BATCH          = 50  # max apps per XPath filter to avoid PAN-OS XPath length limits
@@ -193,7 +193,7 @@ DESIGN_CSV_FIELDNAMES = [
     "tags_to_add",
 ]
 
-SVC_CSV_FIELDNAMES = ["type", "name", "device_group", "protocol", "port"]
+SVC_CSV_FIELDNAMES = ["type", "name", "device_group", "protocol", "port", "rules"]
 
 # ── Data classes ──────────────────────────────────────────────────────────────
 
@@ -1530,6 +1530,7 @@ def main() -> None:
     notes: list[str]            = []
     missing_svc_groups: set[str] = set()
     missing_svc_objects: dict[str, tuple[str, str]] = {}  # name → (protocol, port_spec)
+    missing_svc_rules: dict[str, set[str]] = {}           # name → set of rule names
     design_count               = 0
     new_rule_count             = 0
     unknown_rule_count         = 0
@@ -1926,11 +1927,14 @@ def main() -> None:
                 nonst_ports, ports_raw, svc_port_map, svc_group_map
             )
             missing_svc_groups |= _ns_missing
+            for _grp in _ns_missing:
+                missing_svc_rules.setdefault(_grp, set()).add(rule_name)
             for _tok in _ns_svc.split(" | "):
                 _tok = _tok.strip()
                 _m = _RAW_SINGLE_PORT_RE.match(_tok)
                 if _m and _tok.lower() not in _svc_covered:
                     missing_svc_objects[_tok] = (_m.group(1), _m.group(2))
+                    missing_svc_rules.setdefault(_tok, set()).add(rule_name)
             _new_designs.append(format_nonstandard_rule_design(
                 design_number  = nonstandard_num,
                 rule_name      = rule_name,
@@ -1955,11 +1959,14 @@ def main() -> None:
                 sn_ports, ports_raw, svc_port_map, svc_group_map
             )
             missing_svc_groups |= _sn_missing
+            for _grp in _sn_missing:
+                missing_svc_rules.setdefault(_grp, set()).add(rule_name)
             for _tok in _sn_svc.split(" | "):
                 _tok = _tok.strip()
                 _m = _RAW_SINGLE_PORT_RE.match(_tok)
                 if _m and _tok.lower() not in _svc_covered:
                     missing_svc_objects[_tok] = (_m.group(1), _m.group(2))
+                    missing_svc_rules.setdefault(_tok, set()).add(rule_name)
             _new_designs.append(format_nonstandard_rule_design(
                 design_number  = sn_num,
                 rule_name      = rule_name,
@@ -2199,12 +2206,14 @@ def main() -> None:
             writer.writeheader()
             for _name in sorted(missing_svc_objects):
                 _proto, _port = missing_svc_objects[_name]
+                _rules = ", ".join(sorted(missing_svc_rules.get(_name, set())))
                 writer.writerow({
                     "type":         "service_object",
                     "name":         _name,
                     "device_group": device_group,
                     "protocol":     _proto,
                     "port":         _port,
+                    "rules":        _rules,
                 })
 
     print("=" * 62)

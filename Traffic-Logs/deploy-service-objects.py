@@ -28,7 +28,9 @@ import argparse
 import csv
 import datetime
 import sys
+import threading
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import requests
@@ -38,10 +40,12 @@ import ops_lib  # noqa: E402
 
 requests.packages.urllib3.disable_warnings()
 
-__version__ = "1.0.2"
+__version__ = "1.0.3"
 
 SEP  = "=" * 62
 DASH = "-" * 62
+
+_PRINT_LOCK = threading.Lock()
 
 
 # ── XPath helpers ─────────────────────────────────────────────────────────────
@@ -80,6 +84,50 @@ def _object_exists(xpath: str) -> bool:
         return False
 
 
+# ── Per-row worker ────────────────────────────────────────────────────────────
+
+def _process_row(row: dict, use_shared: bool, dry_run: bool) -> str:
+    """Process one CSV row. Returns 'created', 'skipped', or 'failed'."""
+    name     = row.get("name", "").strip()
+    dg       = ops_lib.DEVICE_GROUP
+    protocol = row.get("protocol", "").strip()
+    port     = row.get("port", "").strip()
+    location = "shared" if use_shared else dg
+
+    if not name or not protocol or not port:
+        with _PRINT_LOCK:
+            print(f"  SKIP  {name or '(no name)'}  — missing required fields")
+        return "skipped"
+
+    xpath = _service_xpath(name, dg, use_shared)
+
+    if _object_exists(xpath):
+        with _PRINT_LOCK:
+            print(f"  SKIP  {name}  — already exists")
+        return "skipped"
+
+    if dry_run:
+        with _PRINT_LOCK:
+            print(f"  DRY-RUN  {name}  ({protocol}/{port})  in {location}")
+        return "created"
+
+    try:
+        element = _service_xml(protocol, port)
+        resp    = ops_lib.api_set(xpath, element)
+        if ops_lib.is_success(resp):
+            with _PRINT_LOCK:
+                print(f"  CREATE  {name}  ({protocol}/{port})  in {location}  ok")
+            return "created"
+        else:
+            with _PRINT_LOCK:
+                print(f"  FAILED  {name}  — {resp[:120]}")
+            return "failed"
+    except Exception as exc:
+        with _PRINT_LOCK:
+            print(f"  FAILED  {name}  — {exc}")
+        return "failed"
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -98,6 +146,10 @@ def main() -> None:
     parser.add_argument(
         "--dry-run", action="store_true",
         help="Print what would be created without making any changes",
+    )
+    parser.add_argument(
+        "--workers", metavar="N", type=int, default=4,
+        help="Parallel worker threads (default: 4)",
     )
     args = parser.parse_args()
 
@@ -124,6 +176,7 @@ def main() -> None:
         print(f"  Scope  : device group {ops_lib.DEVICE_GROUP}")
     if args.dry_run:
         print("  Mode   : dry-run (no changes will be applied)")
+    print(f"  Workers: {args.workers}")
     print()
 
     # ── Load CSV ──────────────────────────────────────────────────────────────
@@ -146,51 +199,17 @@ def main() -> None:
     print(f"  {len(svc_rows)} service object(s) to process")
     print()
 
-    # ── Process each row ──────────────────────────────────────────────────────
-    created_count  = 0
-    skipped_count  = 0
-    failed_count   = 0
-
+    # ── Process rows (parallel) ───────────────────────────────────────────────
     print(SEP)
-    for row in svc_rows:
-        name     = row.get("name", "").strip()
-        dg       = ops_lib.DEVICE_GROUP  # set from --dg; --shared rows don't use this
-        protocol = row.get("protocol", "").strip()
-        port     = row.get("port", "").strip()
+    statuses: list[str] = []
+    with ThreadPoolExecutor(max_workers=args.workers) as ex:
+        futures = [ex.submit(_process_row, row, args.shared, args.dry_run) for row in svc_rows]
+        for f in as_completed(futures):
+            statuses.append(f.result())
 
-        if not name or not protocol or not port:
-            print(f"  SKIP  {name or '(no name)'}  — missing required fields")
-            skipped_count += 1
-            continue
-
-        xpath = _service_xpath(name, dg, args.shared)
-
-        # Check if already exists
-        if _object_exists(xpath):
-            print(f"  SKIP  {name}  — already exists")
-            skipped_count += 1
-            continue
-
-        location = "shared" if args.shared else dg
-        print(f"  {'DRY-RUN' if args.dry_run else 'CREATE'}  {name}  ({protocol}/{port})  in {location}", end="  ")
-
-        if args.dry_run:
-            print()
-            created_count += 1
-            continue
-
-        try:
-            element = _service_xml(protocol, port)
-            resp    = ops_lib.api_set(xpath, element)
-            if ops_lib.is_success(resp):
-                print("ok")
-                created_count += 1
-            else:
-                print(f"FAILED — {resp[:120]}")
-                failed_count += 1
-        except Exception as exc:
-            print(f"FAILED — {exc}")
-            failed_count += 1
+    created_count = statuses.count("created")
+    skipped_count = statuses.count("skipped")
+    failed_count  = statuses.count("failed")
 
     # ── Summary ───────────────────────────────────────────────────────────────
     print(SEP)
