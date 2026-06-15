@@ -131,7 +131,7 @@ requests.packages.urllib3.disable_warnings()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-__version__ = "1.11.19"
+__version__ = "1.11.20"
 
 APP_REVIEW_THRESHOLD     = 10  # flag designs with this many or more usable apps
 APP_FETCH_BATCH          = 50  # max apps per XPath filter to avoid PAN-OS XPath length limits
@@ -217,6 +217,7 @@ class RuleConfig:
     group_profile: str       = ""
     found:         bool      = True
     service:       list[str] = field(default_factory=list)
+    applications:  list[str] = field(default_factory=list)
 
 
 # ── Config file loader ────────────────────────────────────────────────────────
@@ -355,6 +356,13 @@ def fetch_full_rule_configs(rule_names: list[str]) -> dict[str, RuleConfig]:
             if not svc_members and svc_el.text and svc_el.text.strip():
                 svc_members = [svc_el.text.strip()]
 
+        app_el = entry.find("application")
+        app_members: list[str] = []
+        if app_el is not None:
+            app_members = [m.text.strip() for m in app_el.findall("member") if m.text]
+            if not app_members and app_el.text and app_el.text.strip():
+                app_members = [app_el.text.strip()]
+
         configs[name] = RuleConfig(
             name          = name,
             source_zones  = members("from"),
@@ -368,6 +376,7 @@ def fetch_full_rule_configs(rule_names: list[str]) -> dict[str, RuleConfig]:
             group_profile = group_profile,
             found         = True,
             service       = svc_members,
+            applications  = app_members,
         )
 
     for name in rule_names:
@@ -1982,12 +1991,21 @@ def main() -> None:
                 run_month_year = run_month_year,
             ))
         elif app_update_num is not None:
-            _upd_designs.append(format_app_update_design(
-                design_number = app_update_num,
-                rule_name     = rule_name,
-                usable_apps   = main_apps,
-                device_group  = device_group,
-            ))
+            _deployed_apps = {a.lower() for a in configs[f"APP-ID-{rule_name}"].applications}
+            _new_main_apps = [a for a in main_apps if a.lower() not in _deployed_apps]
+            if _new_main_apps:
+                _upd_designs.append(format_app_update_design(
+                    design_number = app_update_num,
+                    rule_name     = rule_name,
+                    usable_apps   = _new_main_apps,
+                    device_group  = device_group,
+                ))
+            else:
+                notes.append((
+                    f"Design {app_update_num} — {rule_name}",
+                    f"APP-ID-{rule_name} already has all observed apps — no update needed.",
+                    NOTE_CAT_EXISTING,
+                ))
 
         if generate_unknown:
             _new_designs.append(format_unknown_rule_design(
@@ -2026,13 +2044,22 @@ def main() -> None:
                 base_tags      = base_existing_tags,
             ))
         elif nonstandard_upd_num is not None:
-            _upd_designs.append(format_app_update_design(
-                design_number = nonstandard_upd_num,
-                rule_name     = rule_name,
-                usable_apps   = nonst_apps,
-                device_group  = device_group,
-                rule_suffix   = "-NS",
-            ))
+            _deployed_ns_apps = {a.lower() for a in configs[f"APP-ID-{rule_name}-NS"].applications}
+            _new_ns_apps = [a for a in nonst_apps if a.lower() not in _deployed_ns_apps]
+            if _new_ns_apps:
+                _upd_designs.append(format_app_update_design(
+                    design_number = nonstandard_upd_num,
+                    rule_name     = rule_name,
+                    usable_apps   = _new_ns_apps,
+                    device_group  = device_group,
+                    rule_suffix   = "-NS",
+                ))
+            else:
+                notes.append((
+                    f"Design {nonstandard_upd_num} — {rule_name}",
+                    f"APP-ID-{rule_name}-NS already has all observed apps — no update needed.",
+                    NOTE_CAT_EXISTING,
+                ))
 
         for sn_app, sn_ports, sn_num in split_ns_nums:
             _sn_svc, _sn_missing = consolidate_ns_service(
