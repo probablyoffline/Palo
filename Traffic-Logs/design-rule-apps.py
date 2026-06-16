@@ -131,7 +131,7 @@ requests.packages.urllib3.disable_warnings()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-__version__ = "1.11.20"
+__version__ = "1.11.21"
 
 APP_REVIEW_THRESHOLD     = 10  # flag designs with this many or more usable apps
 APP_FETCH_BATCH          = 50  # max apps per XPath filter to avoid PAN-OS XPath length limits
@@ -162,8 +162,9 @@ NOTE_CAT_EXISTING  = "Existing rules"
 NOTE_CAT_GENERATED = "New designs"
 NOTE_CAT_REVIEW    = "Investigation / review"
 
-EPHEMERAL_THRESHOLD = 10          # min total remaining ports before substituting a group
-NS_SPLIT_THRESHOLD  = 10          # min per-app NS ports to trigger a split rule
+EPHEMERAL_THRESHOLD      = 10  # min total remaining ports before substituting a group
+NS_SPLIT_THRESHOLD       = 10  # min per-app NS ports to trigger a split rule
+PORT_ONLY_NS_THRESHOLD   = 5   # token count above which a service group is generated
 
 # Windows/RFC-6335 ephemeral range (49152–65535)
 EPHEMERAL_PORT_LO   = 49152
@@ -199,7 +200,7 @@ DESIGN_CSV_FIELDNAMES = [
     "tags_to_add",
 ]
 
-SVC_CSV_FIELDNAMES = ["type", "name", "device_group", "protocol", "port", "rules"]
+SVC_CSV_FIELDNAMES = ["type", "name", "device_group", "protocol", "port", "members", "rules"]
 
 # ── Data classes ──────────────────────────────────────────────────────────────
 
@@ -910,22 +911,26 @@ def format_new_rule_design(
 
 
 def format_unknown_rule_design(
-    design_number:  int | str,
-    rule_name:      str,
-    config:         RuleConfig,
-    unknown_apps:   list[str],
-    ports_raw:      str,
-    device_group:   str,
-    run_month_year: str,
-    has_known_apps: bool,
-    base_tags:      list[str],
+    design_number:     int | str,
+    rule_name:         str,
+    config:            RuleConfig,
+    unknown_apps:      list[str],
+    ports_raw:         str,
+    device_group:      str,
+    run_month_year:    str,
+    has_known_apps:    bool,
+    base_tags:         list[str],
+    unknown_obs_ports: list[str] | None = None,
 ) -> str:
     new_rule_name = f"APP-ID-{rule_name}-UNKNOWN" if has_known_apps else f"APP-ID-{rule_name}"
 
     tags = list(base_tags) + [TAG_NEW_RULE, TAG_UNKNOWN]
 
-    ports = [p.strip() for p in ports_raw.split("|") if p.strip()]
-    service = ", ".join(ports) if ports and ports != ["application-default"] else "application-default"
+    if unknown_obs_ports:
+        service = ", ".join(unknown_obs_ports)
+    else:
+        ports = [p.strip() for p in ports_raw.split("|") if p.strip()]
+        service = ", ".join(ports) if ports and ports != ["application-default"] else "application-default"
 
     lines = [f"Design {design_number}", ""]
     lines += [
@@ -1335,6 +1340,12 @@ def main() -> None:
              " (no designs generated). Useful for diagnosing which rules already have"
              " app-id-under-review or app-id-review-unused before running with --update-existing.",
     )
+    parser.add_argument(
+        "--port-only-ns", action="store_true", dest="port_only_ns",
+        help="Design NS rules with Application=any (port-only matching via service objects). "
+             "When a rule has more than 5 NS port tokens, a named service group "
+             "svc-grp-<rule>-NS is generated so future ports can be added to the group.",
+    )
     args = parser.parse_args()
 
     if args.device_group:
@@ -1570,6 +1581,7 @@ def main() -> None:
     missing_svc_groups: set[str] = set()
     missing_svc_objects: dict[str, tuple[str, str]] = {}  # name → (protocol, port_spec)
     missing_svc_rules: dict[str, set[str]] = {}           # name → set of rule names
+    svc_grp_rows: list[dict] = []                         # service_group rows for svc CSV
     design_count               = 0
     new_rule_count             = 0
     unknown_rule_count         = 0
@@ -1615,6 +1627,12 @@ def main() -> None:
         if exclude_apps:
             app_port_obs = {a: ps for a, ps in app_port_obs.items() if a.lower() not in exclude_apps}
         observed_ports = {p for ps in app_port_obs.values() for p in ps}
+
+        # Ports directly observed for unknown-tcp/udp — used as the UNKNOWN rule's service
+        # since those apps have no PAN-OS default port (application-default won't match).
+        unknown_obs_ports: list[str] = sorted({
+            p for app in unknown_apps for p in app_port_obs.get(app, set())
+        })
 
         # ── Validate configured ports (detect named service objects/groups) ───
         raw_ports = [p.strip() for p in ports_raw.split("|") if p.strip()]
@@ -2009,15 +2027,16 @@ def main() -> None:
 
         if generate_unknown:
             _new_designs.append(format_unknown_rule_design(
-                design_number  = unknown_num,
-                rule_name      = rule_name,
-                config         = config,
-                unknown_apps   = unknown_apps,
-                ports_raw      = effective_ports_raw,
-                device_group   = device_group,
-                run_month_year = run_month_year,
-                has_known_apps = bool(main_apps),
-                base_tags      = base_existing_tags,
+                design_number     = unknown_num,
+                rule_name         = rule_name,
+                config            = config,
+                unknown_apps      = unknown_apps,
+                ports_raw         = effective_ports_raw,
+                device_group      = device_group,
+                run_month_year    = run_month_year,
+                has_known_apps    = bool(main_apps),
+                base_tags         = base_existing_tags,
+                unknown_obs_ports = unknown_obs_ports,
             ))
 
         if generate_nonstandard:
@@ -2033,12 +2052,38 @@ def main() -> None:
                 if _m and _tok.lower() not in _svc_covered:
                     missing_svc_objects[_tok] = (_m.group(1), _m.group(2))
                     missing_svc_rules.setdefault(_tok, set()).add(rule_name)
+
+            # ── Port-only NS mode ─────────────────────────────────────────────
+            _ns_tokens = [t.strip() for t in _ns_svc.split(" | ") if t.strip()]
+            if args.port_only_ns and len(_ns_tokens) > PORT_ONLY_NS_THRESHOLD:
+                _svc_grp_name       = f"svc-grp-{rule_name}-NS"
+                _ns_apps_for_design = ["any"]
+                _ns_svc_for_design  = _svc_grp_name
+                svc_grp_rows.append({
+                    "type":         "service_group",
+                    "name":         _svc_grp_name,
+                    "device_group": device_group,
+                    "protocol":     "",
+                    "port":         "",
+                    "members":      "|".join(_ns_tokens),
+                    "rules":        rule_name,
+                })
+                notes.append((
+                    f"Design {nonstandard_num} — {rule_name}",
+                    f"port-only NS rule (Application=any); service group {_svc_grp_name} "
+                    f"contains {len(_ns_tokens)} port token(s).",
+                    NOTE_CAT_GENERATED,
+                ))
+            else:
+                _ns_apps_for_design = nonst_apps
+                _ns_svc_for_design  = _ns_svc
+
             _new_designs.append(format_nonstandard_rule_design(
                 design_number  = nonstandard_num,
                 rule_name      = rule_name,
                 config         = config,
-                nonst_apps     = nonst_apps,
-                service        = _ns_svc,
+                nonst_apps     = _ns_apps_for_design,
+                service        = _ns_svc_for_design,
                 device_group   = device_group,
                 run_month_year = run_month_year,
                 base_tags      = base_existing_tags,
@@ -2074,12 +2119,37 @@ def main() -> None:
                 if _m and _tok.lower() not in _svc_covered:
                     missing_svc_objects[_tok] = (_m.group(1), _m.group(2))
                     missing_svc_rules.setdefault(_tok, set()).add(rule_name)
+
+            _sn_tokens = [t.strip() for t in _sn_svc.split(" | ") if t.strip()]
+            if args.port_only_ns and len(_sn_tokens) > PORT_ONLY_NS_THRESHOLD:
+                _sn_grp_name        = f"svc-grp-{rule_name}-NS-{sn_app}"
+                _sn_apps_for_design = ["any"]
+                _sn_svc_for_design  = _sn_grp_name
+                svc_grp_rows.append({
+                    "type":         "service_group",
+                    "name":         _sn_grp_name,
+                    "device_group": device_group,
+                    "protocol":     "",
+                    "port":         "",
+                    "members":      "|".join(_sn_tokens),
+                    "rules":        rule_name,
+                })
+                notes.append((
+                    f"Design {sn_num} — {rule_name}",
+                    f"port-only NS rule (Application=any); service group {_sn_grp_name} "
+                    f"contains {len(_sn_tokens)} port token(s).",
+                    NOTE_CAT_GENERATED,
+                ))
+            else:
+                _sn_apps_for_design = [sn_app]
+                _sn_svc_for_design  = _sn_svc
+
             _new_designs.append(format_nonstandard_rule_design(
                 design_number  = sn_num,
                 rule_name      = rule_name,
                 config         = config,
-                nonst_apps     = [sn_app],
-                service        = _sn_svc,
+                nonst_apps     = _sn_apps_for_design,
+                service        = _sn_svc_for_design,
                 device_group   = device_group,
                 run_month_year = run_month_year,
                 base_tags      = base_existing_tags,
@@ -2121,10 +2191,13 @@ def main() -> None:
                 unknown_csv_name = f"APP-ID-{rule_name}-UNKNOWN" if main_apps else f"APP-ID-{rule_name}"
                 unknown_tags = list(base_existing_tags) + [TAG_NEW_RULE, TAG_UNKNOWN]
                 non_any_users = [u for u in config.source_users if u.lower() != "any"]
-                u_ports = [p.strip() for p in (effective_ports_raw or "").split("|") if p.strip()]
-                unknown_service = (" | ".join(u_ports)
-                                   if u_ports and u_ports != ["application-default"]
-                                   else "application-default")
+                if unknown_obs_ports:
+                    unknown_service = ", ".join(unknown_obs_ports)
+                else:
+                    u_ports = [p.strip() for p in (effective_ports_raw or "").split("|") if p.strip()]
+                    unknown_service = (" | ".join(u_ports)
+                                       if u_ports and u_ports != ["application-default"]
+                                       else "application-default")
                 _csv.append({
                     "type":             "new_rule",
                     "device_group":     device_group,
@@ -2159,8 +2232,8 @@ def main() -> None:
                     "source_user":      "|".join(non_any_users),
                     "dest_zones":       "|".join(config.dest_zones),
                     "dest_addresses":   "|".join(config.dest_addrs),
-                    "applications":     "|".join(nonst_apps),
-                    "service":          _ns_svc,
+                    "applications":     "|".join(_ns_apps_for_design),
+                    "service":          _ns_svc_for_design,
                     "action":           config.action,
                     "group_profile":    config.group_profile,
                     "tags_to_add":      "",
@@ -2169,11 +2242,21 @@ def main() -> None:
                 _csv.append(build_app_update_row(rule_name, nonst_apps, device_group, rule_suffix="-NS"))
 
             for sn_app, sn_ports, sn_num in split_ns_nums:
+                sn_tags = list(base_existing_tags) + [TAG_NEW_RULE, TAG_NON_STANDARD]
+                non_any_users = [u for u in config.source_users if u.lower() != "any"]
+                # Reuse the consolidated service computed in the text-design loop above.
+                # _sn_apps_for_design / _sn_svc_for_design are set per-iteration there;
+                # we look them up from the last loop iteration that matches this sn_app.
                 _sn_svc_c, _ = consolidate_ns_service(
                     sn_ports, ports_raw, svc_port_map, svc_group_map
                 )
-                sn_tags = list(base_existing_tags) + [TAG_NEW_RULE, TAG_NON_STANDARD]
-                non_any_users = [u for u in config.source_users if u.lower() != "any"]
+                _sn_tokens_c = [t.strip() for t in _sn_svc_c.split(" | ") if t.strip()]
+                if args.port_only_ns and len(_sn_tokens_c) > PORT_ONLY_NS_THRESHOLD:
+                    _sn_apps_csv = ["any"]
+                    _sn_svc_csv  = f"svc-grp-{rule_name}-NS-{sn_app}"
+                else:
+                    _sn_apps_csv = [sn_app]
+                    _sn_svc_csv  = _sn_svc_c
                 _csv.append({
                     "type":             "new_rule",
                     "device_group":     device_group,
@@ -2186,8 +2269,8 @@ def main() -> None:
                     "source_user":      "|".join(non_any_users),
                     "dest_zones":       "|".join(config.dest_zones),
                     "dest_addresses":   "|".join(config.dest_addrs),
-                    "applications":     sn_app,
-                    "service":          _sn_svc_c,
+                    "applications":     "|".join(_sn_apps_csv),
+                    "service":          _sn_svc_csv,
                     "action":           config.action,
                     "group_profile":    config.group_profile,
                     "tags_to_add":      "",
@@ -2262,9 +2345,9 @@ def main() -> None:
         if _rm:
             missing_svc_objects[_grp] = (_rm.group(1), f"{_rm.group(2)}-{_rm.group(3)}")
 
-    if missing_svc_objects:
+    if missing_svc_objects or svc_grp_rows:
         msg_lines = [_section_header("MISSING SERVICE OBJECTS"), "",
-                     "The following service objects are referenced in NS rule designs",
+                     "The following service objects/groups are referenced in NS rule designs",
                      "but were not found in Panorama.  Run deploy-service-objects.py",
                      f"with the -svc.csv file below before deploying rules:",
                      f"  {svc_csv_path}",
@@ -2272,6 +2355,9 @@ def main() -> None:
         for obj in sorted(missing_svc_objects):
             proto, port = missing_svc_objects[obj]
             msg_lines.append(f"  {obj}  ({proto}/{port})")
+        for _grp_row in svc_grp_rows:
+            _members = _grp_row.get("members", "").split("|")
+            msg_lines.append(f"  {_grp_row['name']}  (service-group, {len(_members)} member(s))")
         preamble.append("\n".join(msg_lines))
 
     if notes:
@@ -2321,7 +2407,7 @@ def main() -> None:
             writer.writeheader()
             writer.writerows(csv_rows_pci)
 
-    if missing_svc_objects:
+    if missing_svc_objects or svc_grp_rows:
         with open(svc_csv_path, "w", newline="", encoding="utf-8") as fh:
             writer = csv.DictWriter(fh, fieldnames=SVC_CSV_FIELDNAMES)
             writer.writeheader()
@@ -2334,8 +2420,11 @@ def main() -> None:
                     "device_group": device_group,
                     "protocol":     _proto,
                     "port":         _port,
+                    "members":      "",
                     "rules":        _rules,
                 })
+            for _grp_row in svc_grp_rows:
+                writer.writerow(_grp_row)
 
     print("=" * 62)
     print(f"  {total_designs} design(s) total")
@@ -2354,7 +2443,7 @@ def main() -> None:
         print(f"  CSV  : {csv_path}")
         if pci_tags and csv_rows_pci:
             print(f"  CSV (PCI) : {pci_csv_path}")
-    if missing_svc_objects:
+    if missing_svc_objects or svc_grp_rows:
         print(f"  CSV (svc) : {svc_csv_path}  ← deploy service objects first")
     print("=" * 62)
 

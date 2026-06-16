@@ -40,7 +40,7 @@ import ops_lib  # noqa: E402
 
 requests.packages.urllib3.disable_warnings()
 
-__version__ = "1.0.3"
+__version__ = "1.0.4"
 
 SEP  = "=" * 62
 DASH = "-" * 62
@@ -71,6 +71,27 @@ def _service_xml(protocol: str, port: str) -> str:
     if proto not in ("tcp", "udp"):
         raise ValueError(f"unsupported protocol '{protocol}' — must be tcp or udp")
     return f"<protocol><{proto}><port>{port}</port></{proto}></protocol>"
+
+
+def _service_group_xpath(name: str, device_group: str, use_shared: bool) -> str:
+    esc_name = name.replace("'", "\\'")
+    if use_shared or ops_lib.MODE != "panorama":
+        if ops_lib.MODE == "panorama":
+            return f"/config/shared/service-group/entry[@name='{esc_name}']"
+        dev = f"/config/devices/entry[@name='localhost.localdomain']"
+        vsys = f"/vsys/entry[@name='{ops_lib.VSYS}']"
+        return f"{dev}{vsys}/service-group/entry[@name='{esc_name}']"
+    dg = device_group or ops_lib.DEVICE_GROUP
+    return (
+        f"/config/devices/entry[@name='localhost.localdomain']"
+        f"/device-group/entry[@name='{dg}']"
+        f"/service-group/entry[@name='{esc_name}']"
+    )
+
+
+def _service_group_xml(members: list[str]) -> str:
+    mbr = "".join(f"<member>{m}</member>" for m in members)
+    return f"<members>{mbr}</members>"
 
 
 # ── Existence check ───────────────────────────────────────────────────────────
@@ -117,6 +138,55 @@ def _process_row(row: dict, use_shared: bool, dry_run: bool) -> str:
         if ops_lib.is_success(resp):
             with _PRINT_LOCK:
                 print(f"  CREATE  {name}  ({protocol}/{port})  in {location}  ok")
+            return "created"
+        else:
+            with _PRINT_LOCK:
+                print(f"  FAILED  {name}  — {resp[:120]}")
+            return "failed"
+    except Exception as exc:
+        with _PRINT_LOCK:
+            print(f"  FAILED  {name}  — {exc}")
+        return "failed"
+
+
+# ── Per-group worker ─────────────────────────────────────────────────────────
+
+def _process_group_row(row: dict, use_shared: bool, dry_run: bool) -> str:
+    """Process one service_group CSV row. Returns 'created', 'skipped', or 'failed'."""
+    name     = row.get("name", "").strip()
+    dg       = ops_lib.DEVICE_GROUP
+    members_raw = row.get("members", "").strip()
+    location = "shared" if use_shared else dg
+
+    if not name or not members_raw:
+        with _PRINT_LOCK:
+            print(f"  SKIP  {name or '(no name)'}  — missing required fields (name/members)")
+        return "skipped"
+
+    members = [m.strip() for m in members_raw.split("|") if m.strip()]
+    if not members:
+        with _PRINT_LOCK:
+            print(f"  SKIP  {name}  — empty members list")
+        return "skipped"
+
+    xpath = _service_group_xpath(name, dg, use_shared)
+
+    if _object_exists(xpath):
+        with _PRINT_LOCK:
+            print(f"  SKIP  {name}  — already exists")
+        return "skipped"
+
+    if dry_run:
+        with _PRINT_LOCK:
+            print(f"  DRY-RUN  {name}  (service-group, {len(members)} member(s))  in {location}")
+        return "created"
+
+    try:
+        element = _service_group_xml(members)
+        resp    = ops_lib.api_set(xpath, element)
+        if ops_lib.is_success(resp):
+            with _PRINT_LOCK:
+                print(f"  CREATE  {name}  (service-group, {len(members)} member(s))  in {location}  ok")
             return "created"
         else:
             with _PRINT_LOCK:
@@ -192,24 +262,38 @@ def main() -> None:
         return
 
     svc_rows = [r for r in rows if r.get("type", "").strip() == "service_object"]
-    if not svc_rows:
-        print("No service_object rows found — nothing to do.")
+    grp_rows = [r for r in rows if r.get("type", "").strip() == "service_group"]
+
+    if not svc_rows and not grp_rows:
+        print("No service_object or service_group rows found — nothing to do.")
         return
 
-    print(f"  {len(svc_rows)} service object(s) to process")
+    if svc_rows:
+        print(f"  {len(svc_rows)} service object(s) to process")
+    if grp_rows:
+        print(f"  {len(grp_rows)} service group(s) to process")
     print()
 
-    # ── Process rows (parallel) ───────────────────────────────────────────────
+    # ── Pass 1: service objects (parallel) ────────────────────────────────────
     print(SEP)
     statuses: list[str] = []
-    with ThreadPoolExecutor(max_workers=args.workers) as ex:
-        futures = [ex.submit(_process_row, row, args.shared, args.dry_run) for row in svc_rows]
-        for f in as_completed(futures):
-            statuses.append(f.result())
+    if svc_rows:
+        with ThreadPoolExecutor(max_workers=args.workers) as ex:
+            futures = [ex.submit(_process_row, row, args.shared, args.dry_run) for row in svc_rows]
+            for f in as_completed(futures):
+                statuses.append(f.result())
 
-    created_count = statuses.count("created")
-    skipped_count = statuses.count("skipped")
-    failed_count  = statuses.count("failed")
+    # ── Pass 2: service groups (sequential — depend on objects from pass 1) ───
+    grp_statuses: list[str] = []
+    if grp_rows:
+        if svc_rows:
+            print(SEP)
+        for row in grp_rows:
+            grp_statuses.append(_process_group_row(row, args.shared, args.dry_run))
+
+    created_count = statuses.count("created") + grp_statuses.count("created")
+    skipped_count = statuses.count("skipped") + grp_statuses.count("skipped")
+    failed_count  = statuses.count("failed")  + grp_statuses.count("failed")
 
     # ── Summary ───────────────────────────────────────────────────────────────
     print(SEP)
