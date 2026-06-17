@@ -116,6 +116,7 @@ NS rule service consolidation:
 import argparse
 import csv
 import datetime
+import fnmatch
 import re
 import sys
 import xml.etree.ElementTree as ET
@@ -131,7 +132,7 @@ requests.packages.urllib3.disable_warnings()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-__version__ = "1.11.26"
+__version__ = "1.11.27"
 
 APP_REVIEW_THRESHOLD     = 10  # flag designs with this many or more usable apps
 APP_FETCH_BATCH          = 50  # max apps per XPath filter to avoid PAN-OS XPath length limits
@@ -144,6 +145,7 @@ PCI_FLAGS_FILE         = SCRIPT_DIR / "flags-pci.txt"
 NS_SPLIT_APPS_FILE     = SCRIPT_DIR / "ns-split-apps.txt"
 EXCLUDE_NEW_RULE_TAGS_FILE = SCRIPT_DIR / "exclude-new-rule-tags.txt"
 EXCLUDE_APPS_FILE          = SCRIPT_DIR / "exclude-apps.txt"
+SKIP_RULE_TAGS_FILE        = SCRIPT_DIR / "skip-rule-tags.txt"
 
 DEFAULT_RISKY_APPS = frozenset({"ssh", "ms-rdp", "telnet", "ftp", "tftp"})
 
@@ -219,6 +221,7 @@ class RuleConfig:
     action:        str       = "allow"
     group_profile: str       = ""
     found:         bool      = True
+    disabled:      bool      = False
     service:       list[str] = field(default_factory=list)
     applications:  list[str] = field(default_factory=list)
 
@@ -378,6 +381,7 @@ def fetch_full_rule_configs(rule_names: list[str]) -> dict[str, RuleConfig]:
             action        = (entry.findtext("action") or "allow").strip(),
             group_profile = group_profile,
             found         = True,
+            disabled      = (entry.findtext("disabled") or "").strip().lower() == "yes",
             service       = svc_members,
             applications  = app_members,
         )
@@ -1275,6 +1279,15 @@ def merge_csv_rows(all_rows: list[list[dict]]) -> list[dict]:
     return result
 
 
+def _tag_matches_patterns(tags: list[str], patterns: list[str]) -> str | None:
+    """Return the first tag matching any glob pattern, or None."""
+    for tag in tags:
+        for pat in patterns:
+            if fnmatch.fnmatch(tag.lower(), pat):
+                return tag
+    return None
+
+
 def format_addr_group_design(name: str, device_group: str, members: list[str]) -> str:
     return "\n".join([
         "In [host_group_dg]",
@@ -1337,6 +1350,16 @@ def main() -> None:
         help=f"File listing app names to exclude from all designs"
              f" (default: {EXCLUDE_APPS_FILE.name} in script directory;"
              f" omit file to exclude no apps)",
+    )
+    parser.add_argument(
+        "--skip-disabled", action="store_true",
+        help="Skip rules that are disabled in Panorama (no design generated).",
+    )
+    parser.add_argument(
+        "--skip-rule-tags", metavar="FILE", dest="skip_rule_tags_file",
+        help=f"File of glob patterns (one per line); rules whose existing tags match any"
+             f" pattern are skipped entirely. Default: {SKIP_RULE_TAGS_FILE.name} in"
+             f" script directory.",
     )
     parser.add_argument(
         "--no-csv", action="store_true",
@@ -1434,6 +1457,16 @@ def main() -> None:
         exclude_apps = frozenset(
             load_set_from_file(ea_path, default=frozenset(), label="exclude-apps")
         )
+
+    skip_rule_tag_patterns: list[str] = []
+    srt_path = Path(args.skip_rule_tags_file) if args.skip_rule_tags_file else SKIP_RULE_TAGS_FILE
+    if srt_path.exists():
+        _raw_srt = load_set_from_file(srt_path, default=frozenset(), label="skip-rule-tags")
+        skip_rule_tag_patterns = [p.lower() for p in _raw_srt if p]
+        if skip_rule_tag_patterns:
+            print(f"  Skip-rule-tag patterns ({len(skip_rule_tag_patterns)}): "
+                  f"{', '.join(skip_rule_tag_patterns)}")
+
     if pci_tags and not args.no_csv:
         print(f"  PCI csv     : {pci_csv_path}")
     if exclude_apps:
@@ -1631,6 +1664,17 @@ def main() -> None:
         ports_raw    = row.get("ports", "").strip()
         app_port_raw = row.get("app_port_details", "").strip()
         config             = configs[rule_name]
+
+        if args.skip_disabled and config.disabled:
+            print(f"  Skipping {rule_name} — disabled in Panorama")
+            continue
+
+        if skip_rule_tag_patterns:
+            _skip_tag = _tag_matches_patterns(config.existing_tags, skip_rule_tag_patterns)
+            if _skip_tag:
+                print(f"  Skipping {rule_name} — tag '{_skip_tag}' matches skip pattern")
+                continue
+
         _tag_exclude = {TAG_UNUSED, TAG_UNDER_REVIEW} | exclude_new_rule_tags
         base_existing_tags = [t for t in config.existing_tags if t not in _tag_exclude]
         pci                = is_pci_rule(config, pci_tags)
