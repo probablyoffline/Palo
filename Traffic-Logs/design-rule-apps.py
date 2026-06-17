@@ -131,7 +131,7 @@ requests.packages.urllib3.disable_warnings()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-__version__ = "1.11.22"
+__version__ = "1.11.23"
 
 APP_REVIEW_THRESHOLD     = 10  # flag designs with this many or more usable apps
 APP_FETCH_BATCH          = 50  # max apps per XPath filter to avoid PAN-OS XPath length limits
@@ -1679,6 +1679,17 @@ def main() -> None:
         # NONSTANDARD rule: apps seen on non-standard ports
         nonst_apps = list(dict.fromkeys(nonst_observed_apps))
 
+        # Under --port-only-ns, a named service/port group on the original rule already
+        # restricts which ports are allowed. Generating a separate NS rule on top is
+        # redundant — fold NS apps into the main rule so they're covered by that group.
+        _ns_suppressed_named_svc = False
+        if args.port_only_ns and has_named_service and nonst_apps:
+            main_apps   = list(dict.fromkeys(main_apps + nonst_apps))
+            nonst_apps  = []
+            nonst_ports = set()
+            nonst_app_ports = {}
+            _ns_suppressed_named_svc = True
+
         has_no_apps = not main_apps and not nonst_apps and not has_unknown and not risky_app_list
 
         if complete == "no" and has_no_apps:
@@ -1861,6 +1872,13 @@ def main() -> None:
                 f"Design {first_num} — {rule_name}",
                 f"service config contains named objects/groups — application-default used. "
                 f"Original service: {ports_raw}",
+                NOTE_CAT_CONFIG,
+            ))
+        if _ns_suppressed_named_svc:
+            notes.append((
+                f"Design {first_num} — {rule_name}",
+                f"NS rule suppressed (--port-only-ns): original rule has a named service group "
+                f"({ports_raw}); NS-classified apps folded into the main APP-ID rule.",
                 NOTE_CAT_CONFIG,
             ))
         if unknown_std_apps:
