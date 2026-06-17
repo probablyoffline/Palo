@@ -131,7 +131,7 @@ requests.packages.urllib3.disable_warnings()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-__version__ = "1.11.24"
+__version__ = "1.11.25"
 
 APP_REVIEW_THRESHOLD     = 10  # flag designs with this many or more usable apps
 APP_FETCH_BATCH          = 50  # max apps per XPath filter to avoid PAN-OS XPath length limits
@@ -866,8 +866,9 @@ def _csv_list(items: list[str]) -> str:
 
 def _addr_group_name(rule_name: str, suffix: str) -> str:
     """Return a Panorama-safe address group name capped at 63 chars."""
-    max_rule = 63 - len(suffix)
-    return f"{rule_name[:max_rule]}{suffix}"
+    prefix = "hst-grp-"
+    max_rule = 63 - len(prefix) - len(suffix)
+    return f"{prefix}{rule_name[:max_rule]}{suffix}"
 
 
 def format_new_rule_design(
@@ -1272,6 +1273,15 @@ def merge_csv_rows(all_rows: list[list[dict]]) -> list[dict]:
         })
 
     return result
+
+
+def format_addr_group_design(name: str, device_group: str, members: list[str]) -> str:
+    return "\n".join([
+        f"In {device_group}",
+        "Create address group",
+        f"Address Group Name: {name}",
+        f"Addresses: {', '.join(members)}",
+    ])
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -2465,6 +2475,20 @@ def main() -> None:
         sections.append(_section_header("PCI — NEW RULES") + "\n\n" + "\n\n---\n\n".join(new_rule_designs_pci))
     if update_designs_pci:
         sections.append(_section_header("PCI — RULE UPDATES") + "\n\n" + "\n\n---\n\n".join(update_designs_pci))
+    if addr_grp_rows:
+        _addr_designs = [
+            format_addr_group_design(
+                name=r["name"],
+                device_group=r["device_group"],
+                members=[m.strip() for m in r["members"].split("|") if m.strip()],
+            )
+            for r in addr_grp_rows
+        ]
+        sections.append(
+            _section_header("ADDRESS GROUP DEFINITIONS")
+            + "\n\n"
+            + "\n\n---\n\n".join(_addr_designs)
+        )
     text_output = "\n\n\n\n".join(preamble + sections)
 
     with open(txt_path, "w", encoding="utf-8") as fh:
