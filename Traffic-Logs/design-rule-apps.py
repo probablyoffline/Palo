@@ -131,7 +131,7 @@ requests.packages.urllib3.disable_warnings()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-__version__ = "1.11.25"
+__version__ = "1.11.26"
 
 APP_REVIEW_THRESHOLD     = 10  # flag designs with this many or more usable apps
 APP_FETCH_BATCH          = 50  # max apps per XPath filter to avoid PAN-OS XPath length limits
@@ -165,7 +165,7 @@ NOTE_CAT_REVIEW    = "Investigation / review"
 EPHEMERAL_THRESHOLD      = 10  # min total remaining ports before substituting a group
 NS_SPLIT_THRESHOLD       = 10  # min per-app NS ports to trigger a split rule
 PORT_ONLY_NS_THRESHOLD   = 5   # token count above which a service group is generated
-HOST_GROUP_THRESHOLD     = 5   # address count above which a named group is substituted
+HOST_GROUP_THRESHOLD     = 10  # group when source or dest address count is >= this
 
 # Windows/RFC-6335 ephemeral range (49152–65535)
 EPHEMERAL_PORT_LO   = 49152
@@ -889,7 +889,7 @@ def format_new_rule_design(
         f"New Rule Name: APP-ID-{rule_name}",
     ]
 
-    lines.append(f"Description: DDD created {run_month_year}")
+    lines.append(f"Description: [request_item] created {run_month_year}")
 
     lines.append(f"Tags: {_csv_list(new_rule_tags)}")
     lines.append("")
@@ -946,7 +946,7 @@ def format_unknown_rule_design(
         f"In {device_group}",
         f"Clone Rule ABOVE: {rule_name}",
         f"New Rule Name: {new_rule_name}",
-        f"Description: DDD created {run_month_year}",
+        f"Description: [request_item] created {run_month_year}",
         f"Tags: {_csv_list(tags)}",
         "",
         f"Source Zone: {_csv_list(config.source_zones)}",
@@ -984,7 +984,7 @@ def format_rule_update(
         f"In {device_group}",
         f"Action: Add tag",
         f"Rule Name: {rule_name}",
-        f"Description: DDD updated {run_month_year}",
+        f"Description: [request_item] updated {run_month_year}",
         f"Tag: {tag}",
     ])
 
@@ -1001,7 +1001,7 @@ def format_unused_design(
         f"In {device_group}",
         f"Action: Add tag",
         f"Rule Name: {rule_name}",
-        f"Description: DDD updated {run_month_year}",
+        f"Description: [request_item] updated {run_month_year}",
         f"Tag: {TAG_UNUSED}",
     ])
 
@@ -1020,7 +1020,7 @@ def build_new_rule_row(
     desc_lines = []
     if config.description:
         desc_lines.append(config.description)
-    desc_lines.append(f"DDD created {run_month_year}")
+    desc_lines.append(f"[request_item] created {run_month_year}")
 
     non_any_users = [u for u in config.source_users if u.lower() != "any"]
 
@@ -1109,7 +1109,7 @@ def format_nonstandard_rule_design(
         f"In {device_group}",
         f"Clone Rule ABOVE: {rule_name}",
         f"New Rule Name: APP-ID-{rule_name}{rule_suffix}",
-        f"Description: DDD created {run_month_year}",
+        f"Description: [request_item] created {run_month_year}",
         f"Tags: {_csv_list(tags)}",
         "",
         f"Source Zone: {_csv_list(config.source_zones)}",
@@ -1147,7 +1147,7 @@ def format_risky_rule_design(
         f"In {device_group}",
         f"Clone Rule ABOVE: {rule_name}",
         f"New Rule Name: APP-ID-{rule_name}-RISKY",
-        f"Description: DDD created {run_month_year}",
+        f"Description: [request_item] created {run_month_year}",
         f"Tags: {_csv_list(tags)}",
         "",
         f"Source Zone: {_csv_list(config.source_zones)}",
@@ -1277,7 +1277,7 @@ def merge_csv_rows(all_rows: list[list[dict]]) -> list[dict]:
 
 def format_addr_group_design(name: str, device_group: str, members: list[str]) -> str:
     return "\n".join([
-        f"In {device_group}",
+        "In [host_group_dg]",
         "Create address group",
         f"Address Group Name: {name}",
         f"Addresses: {', '.join(members)}",
@@ -1746,7 +1746,7 @@ def main() -> None:
         if args.host_groups:
             _new_src = config.source_addrs
             _new_dst = config.dest_addrs
-            if len(config.source_addrs) > HOST_GROUP_THRESHOLD:
+            if len(config.source_addrs) >= HOST_GROUP_THRESHOLD:
                 _src_grp = _addr_group_name(rule_name, "-src")
                 addr_grp_rows.append({
                     "type":         "address_group",
@@ -1758,7 +1758,7 @@ def main() -> None:
                     "rules":        rule_name,
                 })
                 _new_src = [_src_grp]
-            if len(config.dest_addrs) > HOST_GROUP_THRESHOLD:
+            if len(config.dest_addrs) >= HOST_GROUP_THRESHOLD:
                 _dst_grp = _addr_group_name(rule_name, "-dst")
                 addr_grp_rows.append({
                     "type":         "address_group",
@@ -2285,7 +2285,7 @@ def main() -> None:
                     "device_group":     device_group,
                     "rule_name":        unknown_csv_name,
                     "clone_above":      rule_name,
-                    "description":      f"DDD created {run_month_year}",
+                    "description":      f"[request_item] created {run_month_year}",
                     "tags":             "|".join(unknown_tags),
                     "source_zones":     "|".join(_config.source_zones),
                     "source_addresses": "|".join(_config.source_addrs),
@@ -2307,7 +2307,7 @@ def main() -> None:
                     "device_group":     device_group,
                     "rule_name":        f"APP-ID-{rule_name}-NS",
                     "clone_above":      rule_name,
-                    "description":      f"DDD created {run_month_year}",
+                    "description":      f"[request_item] created {run_month_year}",
                     "tags":             "|".join(nonst_tags),
                     "source_zones":     "|".join(_config.source_zones),
                     "source_addresses": "|".join(_config.source_addrs),
@@ -2347,7 +2347,7 @@ def main() -> None:
                     "device_group":     device_group,
                     "rule_name":        f"APP-ID-{rule_name}-NS-{sn_app}",
                     "clone_above":      rule_name,
-                    "description":      f"DDD created {run_month_year}",
+                    "description":      f"[request_item] created {run_month_year}",
                     "tags":             "|".join(sn_tags),
                     "source_zones":     "|".join(_config.source_zones),
                     "source_addresses": "|".join(_config.source_addrs),
@@ -2369,7 +2369,7 @@ def main() -> None:
                     "device_group":     device_group,
                     "rule_name":        f"APP-ID-{rule_name}-RISKY",
                     "clone_above":      rule_name,
-                    "description":      f"DDD created {run_month_year}",
+                    "description":      f"[request_item] created {run_month_year}",
                     "tags":             "|".join(risky_tags),
                     "source_zones":     "|".join(_config.source_zones),
                     "source_addresses": "|".join(_config.source_addrs),
