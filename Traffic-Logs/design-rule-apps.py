@@ -119,7 +119,7 @@ import datetime
 import re
 import sys
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import requests
@@ -131,7 +131,7 @@ requests.packages.urllib3.disable_warnings()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-__version__ = "1.11.23"
+__version__ = "1.11.24"
 
 APP_REVIEW_THRESHOLD     = 10  # flag designs with this many or more usable apps
 APP_FETCH_BATCH          = 50  # max apps per XPath filter to avoid PAN-OS XPath length limits
@@ -165,6 +165,7 @@ NOTE_CAT_REVIEW    = "Investigation / review"
 EPHEMERAL_THRESHOLD      = 10  # min total remaining ports before substituting a group
 NS_SPLIT_THRESHOLD       = 10  # min per-app NS ports to trigger a split rule
 PORT_ONLY_NS_THRESHOLD   = 5   # token count above which a service group is generated
+HOST_GROUP_THRESHOLD     = 5   # address count above which a named group is substituted
 
 # Windows/RFC-6335 ephemeral range (49152–65535)
 EPHEMERAL_PORT_LO   = 49152
@@ -200,7 +201,8 @@ DESIGN_CSV_FIELDNAMES = [
     "tags_to_add",
 ]
 
-SVC_CSV_FIELDNAMES = ["type", "name", "device_group", "protocol", "port", "members", "rules"]
+SVC_CSV_FIELDNAMES  = ["type", "name", "device_group", "protocol", "port", "members", "rules"]
+ADDR_CSV_FIELDNAMES = ["type", "name", "device_group", "address_type", "value", "members", "rules"]
 
 # ── Data classes ──────────────────────────────────────────────────────────────
 
@@ -862,6 +864,12 @@ def _csv_list(items: list[str]) -> str:
     return ", ".join(items) if items else "(none)"
 
 
+def _addr_group_name(rule_name: str, suffix: str) -> str:
+    """Return a Panorama-safe address group name capped at 63 chars."""
+    max_rule = 63 - len(suffix)
+    return f"{rule_name[:max_rule]}{suffix}"
+
+
 def format_new_rule_design(
     design_number:  int | str,
     rule_name:      str,
@@ -1341,6 +1349,12 @@ def main() -> None:
              " app-id-under-review or app-id-review-unused before running with --update-existing.",
     )
     parser.add_argument(
+        "--host-groups", action="store_true", dest="host_groups",
+        help="When source or destination has more than 5 address members, substitute a "
+             "named address group ({rule}-src / {rule}-dst) in the design and write the "
+             "group definition to the -addr.csv output file.",
+    )
+    parser.add_argument(
         "--port-only-ns", action="store_true", dest="port_only_ns",
         help="Design NS rules with Application=any (port-only matching via service objects). "
              "When a rule has more than 5 NS port tokens, a named service group "
@@ -1362,10 +1376,11 @@ def main() -> None:
         output_stem = args.output or f"Output/rule-design-merged-{timestamp}"
     Path(output_stem).parent.mkdir(parents=True, exist_ok=True)
 
-    txt_path     = f"{output_stem}.txt"
-    csv_path     = f"{output_stem}.csv"
-    pci_csv_path = f"{output_stem}-pci.csv"
-    svc_csv_path = f"{output_stem}-svc.csv"
+    txt_path      = f"{output_stem}.txt"
+    csv_path      = f"{output_stem}.csv"
+    pci_csv_path  = f"{output_stem}-pci.csv"
+    svc_csv_path  = f"{output_stem}-svc.csv"
+    addr_csv_path = f"{output_stem}-addr.csv"
 
     port_mode = "static (standard-ports.txt)" if args.static_ports else "dynamic (Panorama app-id database)"
 
@@ -1582,6 +1597,7 @@ def main() -> None:
     missing_svc_objects: dict[str, tuple[str, str]] = {}  # name → (protocol, port_spec)
     missing_svc_rules: dict[str, set[str]] = {}           # name → set of rule names
     svc_grp_rows: list[dict] = []                         # service_group rows for svc CSV
+    addr_grp_rows: list[dict] = []                        # address_group rows for addr CSV
     design_count               = 0
     new_rule_count             = 0
     unknown_rule_count         = 0
@@ -1714,6 +1730,38 @@ def main() -> None:
                     if not args.no_csv:
                         csv_rows.append(build_tag_update_row(rule_name, TAG_UNUSED, device_group))
             continue
+
+        # ── Address group substitution ────────────────────────────────────────
+        _config = config  # replaced by a dataclass copy when --host-groups groups addresses
+        if args.host_groups:
+            _new_src = config.source_addrs
+            _new_dst = config.dest_addrs
+            if len(config.source_addrs) > HOST_GROUP_THRESHOLD:
+                _src_grp = _addr_group_name(rule_name, "-src")
+                addr_grp_rows.append({
+                    "type":         "address_group",
+                    "name":         _src_grp,
+                    "device_group": device_group,
+                    "address_type": "",
+                    "value":        "",
+                    "members":      "|".join(config.source_addrs),
+                    "rules":        rule_name,
+                })
+                _new_src = [_src_grp]
+            if len(config.dest_addrs) > HOST_GROUP_THRESHOLD:
+                _dst_grp = _addr_group_name(rule_name, "-dst")
+                addr_grp_rows.append({
+                    "type":         "address_group",
+                    "name":         _dst_grp,
+                    "device_group": device_group,
+                    "address_type": "",
+                    "value":        "",
+                    "members":      "|".join(config.dest_addrs),
+                    "rules":        rule_name,
+                })
+                _new_dst = [_dst_grp]
+            if _new_src is not config.source_addrs or _new_dst is not config.dest_addrs:
+                _config = replace(config, source_addrs=_new_src, dest_addrs=_new_dst)
 
         # ── Port filtering and service determination for main rule ────────────
         filtered: list[str] = []
@@ -2019,7 +2067,7 @@ def main() -> None:
             _new_designs.append(format_new_rule_design(
                 design_number  = known_num,
                 rule_name      = rule_name,
-                config         = config,
+                config         = _config,
                 usable_apps    = main_apps,
                 service        = service,
                 new_rule_tags  = new_rule_tags,
@@ -2047,7 +2095,7 @@ def main() -> None:
             _new_designs.append(format_unknown_rule_design(
                 design_number     = unknown_num,
                 rule_name         = rule_name,
-                config            = config,
+                config            = _config,
                 unknown_apps      = unknown_apps,
                 ports_raw         = effective_ports_raw,
                 device_group      = device_group,
@@ -2102,7 +2150,7 @@ def main() -> None:
             _new_designs.append(format_nonstandard_rule_design(
                 design_number  = nonstandard_num,
                 rule_name      = rule_name,
-                config         = config,
+                config         = _config,
                 nonst_apps     = _ns_apps_for_design,
                 service        = _ns_svc_for_design,
                 device_group   = device_group,
@@ -2171,7 +2219,7 @@ def main() -> None:
             _new_designs.append(format_nonstandard_rule_design(
                 design_number  = sn_num,
                 rule_name      = rule_name,
-                config         = config,
+                config         = _config,
                 nonst_apps     = _sn_apps_for_design,
                 service        = _sn_svc_for_design,
                 device_group   = device_group,
@@ -2184,7 +2232,7 @@ def main() -> None:
             _new_designs.append(format_risky_rule_design(
                 design_number  = risky_num,
                 rule_name      = rule_name,
-                config         = config,
+                config         = _config,
                 risky_apps     = risky_app_list,
                 device_group   = device_group,
                 run_month_year = run_month_year,
@@ -2201,7 +2249,7 @@ def main() -> None:
             if generate_known and main_apps:
                 _csv.append(build_new_rule_row(
                     rule_name      = rule_name,
-                    config         = config,
+                    config         = _config,
                     usable_apps    = main_apps,
                     service        = service,
                     new_rule_tags  = new_rule_tags,
@@ -2229,11 +2277,11 @@ def main() -> None:
                     "clone_above":      rule_name,
                     "description":      f"DDD created {run_month_year}",
                     "tags":             "|".join(unknown_tags),
-                    "source_zones":     "|".join(config.source_zones),
-                    "source_addresses": "|".join(config.source_addrs),
+                    "source_zones":     "|".join(_config.source_zones),
+                    "source_addresses": "|".join(_config.source_addrs),
                     "source_user":      "|".join(non_any_users),
-                    "dest_zones":       "|".join(config.dest_zones),
-                    "dest_addresses":   "|".join(config.dest_addrs),
+                    "dest_zones":       "|".join(_config.dest_zones),
+                    "dest_addresses":   "|".join(_config.dest_addrs),
                     "applications":     "|".join(unknown_apps),
                     "service":          unknown_service,
                     "action":           config.action,
@@ -2251,11 +2299,11 @@ def main() -> None:
                     "clone_above":      rule_name,
                     "description":      f"DDD created {run_month_year}",
                     "tags":             "|".join(nonst_tags),
-                    "source_zones":     "|".join(config.source_zones),
-                    "source_addresses": "|".join(config.source_addrs),
+                    "source_zones":     "|".join(_config.source_zones),
+                    "source_addresses": "|".join(_config.source_addrs),
                     "source_user":      "|".join(non_any_users),
-                    "dest_zones":       "|".join(config.dest_zones),
-                    "dest_addresses":   "|".join(config.dest_addrs),
+                    "dest_zones":       "|".join(_config.dest_zones),
+                    "dest_addresses":   "|".join(_config.dest_addrs),
                     "applications":     "|".join(_ns_apps_for_design),
                     "service":          _ns_svc_for_design,
                     "action":           config.action,
@@ -2291,11 +2339,11 @@ def main() -> None:
                     "clone_above":      rule_name,
                     "description":      f"DDD created {run_month_year}",
                     "tags":             "|".join(sn_tags),
-                    "source_zones":     "|".join(config.source_zones),
-                    "source_addresses": "|".join(config.source_addrs),
+                    "source_zones":     "|".join(_config.source_zones),
+                    "source_addresses": "|".join(_config.source_addrs),
                     "source_user":      "|".join(non_any_users),
-                    "dest_zones":       "|".join(config.dest_zones),
-                    "dest_addresses":   "|".join(config.dest_addrs),
+                    "dest_zones":       "|".join(_config.dest_zones),
+                    "dest_addresses":   "|".join(_config.dest_addrs),
                     "applications":     "|".join(_sn_apps_csv),
                     "service":          _sn_svc_csv,
                     "action":           config.action,
@@ -2313,11 +2361,11 @@ def main() -> None:
                     "clone_above":      rule_name,
                     "description":      f"DDD created {run_month_year}",
                     "tags":             "|".join(risky_tags),
-                    "source_zones":     "|".join(config.source_zones),
-                    "source_addresses": "|".join(config.source_addrs),
+                    "source_zones":     "|".join(_config.source_zones),
+                    "source_addresses": "|".join(_config.source_addrs),
                     "source_user":      "|".join(non_any_users),
-                    "dest_zones":       "|".join(config.dest_zones),
-                    "dest_addresses":   "|".join(config.dest_addrs),
+                    "dest_zones":       "|".join(_config.dest_zones),
+                    "dest_addresses":   "|".join(_config.dest_addrs),
                     "applications":     "|".join(risky_app_list),
                     "service":          "application-default",
                     "action":           config.action,
@@ -2453,6 +2501,12 @@ def main() -> None:
             for _grp_row in svc_grp_rows:
                 writer.writerow(_grp_row)
 
+    if addr_grp_rows:
+        with open(addr_csv_path, "w", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=ADDR_CSV_FIELDNAMES)
+            writer.writeheader()
+            writer.writerows(addr_grp_rows)
+
     print("=" * 62)
     print(f"  {total_designs} design(s) total")
     print(f"  {total_new} new rule(s) ({nonstandard_rule_count} NS, {risky_rule_count} RISKY)"
@@ -2472,6 +2526,8 @@ def main() -> None:
             print(f"  CSV (PCI) : {pci_csv_path}")
     if missing_svc_objects or svc_grp_rows:
         print(f"  CSV (svc) : {svc_csv_path}  ← deploy service objects first")
+    if addr_grp_rows:
+        print(f"  CSV (addr): {addr_csv_path}  ← deploy address groups before rules")
     print("=" * 62)
 
 
