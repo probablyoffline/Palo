@@ -1,0 +1,12 @@
+# skip-rule-tags.txt
+#
+# Rules whose existing Panorama tags match any pattern listed here are skipped
+# entirely — no App-ID design is generated for them.
+#
+# One glob pattern per line. Wildcards: * matches any characters, ? matches one.
+# Matching is case-insensitive. Lines starting with # are comments.
+#
+# Examples:
+# rule-expired*
+# rule-temp*
+# retired-*
