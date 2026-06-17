@@ -131,7 +131,7 @@ requests.packages.urllib3.disable_warnings()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-__version__ = "1.11.21"
+__version__ = "1.11.22"
 
 APP_REVIEW_THRESHOLD     = 10  # flag designs with this many or more usable apps
 APP_FETCH_BATCH          = 50  # max apps per XPath filter to avoid PAN-OS XPath length limits
@@ -2055,25 +2055,28 @@ def main() -> None:
 
             # ── Port-only NS mode ─────────────────────────────────────────────
             _ns_tokens = [t.strip() for t in _ns_svc.split(" | ") if t.strip()]
-            if args.port_only_ns and len(_ns_tokens) > PORT_ONLY_NS_THRESHOLD:
-                _svc_grp_name       = f"svc-grp-{rule_name}-NS"
+            if args.port_only_ns:
                 _ns_apps_for_design = ["any"]
-                _ns_svc_for_design  = _svc_grp_name
-                svc_grp_rows.append({
-                    "type":         "service_group",
-                    "name":         _svc_grp_name,
-                    "device_group": device_group,
-                    "protocol":     "",
-                    "port":         "",
-                    "members":      "|".join(_ns_tokens),
-                    "rules":        rule_name,
-                })
-                notes.append((
-                    f"Design {nonstandard_num} — {rule_name}",
-                    f"port-only NS rule (Application=any); service group {_svc_grp_name} "
-                    f"contains {len(_ns_tokens)} port token(s).",
-                    NOTE_CAT_GENERATED,
-                ))
+                if len(_ns_tokens) > PORT_ONLY_NS_THRESHOLD:
+                    _svc_grp_name      = f"svc-grp-{rule_name}-NS"
+                    _ns_svc_for_design = _svc_grp_name
+                    svc_grp_rows.append({
+                        "type":         "service_group",
+                        "name":         _svc_grp_name,
+                        "device_group": device_group,
+                        "protocol":     "",
+                        "port":         "",
+                        "members":      "|".join(_ns_tokens),
+                        "rules":        rule_name,
+                    })
+                    notes.append((
+                        f"Design {nonstandard_num} — {rule_name}",
+                        f"port-only NS rule (Application=any); service group {_svc_grp_name} "
+                        f"contains {len(_ns_tokens)} port token(s).",
+                        NOTE_CAT_GENERATED,
+                    ))
+                else:
+                    _ns_svc_for_design = _ns_svc
             else:
                 _ns_apps_for_design = nonst_apps
                 _ns_svc_for_design  = _ns_svc
@@ -2121,25 +2124,28 @@ def main() -> None:
                     missing_svc_rules.setdefault(_tok, set()).add(rule_name)
 
             _sn_tokens = [t.strip() for t in _sn_svc.split(" | ") if t.strip()]
-            if args.port_only_ns and len(_sn_tokens) > PORT_ONLY_NS_THRESHOLD:
-                _sn_grp_name        = f"svc-grp-{rule_name}-NS-{sn_app}"
+            if args.port_only_ns:
                 _sn_apps_for_design = ["any"]
-                _sn_svc_for_design  = _sn_grp_name
-                svc_grp_rows.append({
-                    "type":         "service_group",
-                    "name":         _sn_grp_name,
-                    "device_group": device_group,
-                    "protocol":     "",
-                    "port":         "",
-                    "members":      "|".join(_sn_tokens),
-                    "rules":        rule_name,
-                })
-                notes.append((
-                    f"Design {sn_num} — {rule_name}",
-                    f"port-only NS rule (Application=any); service group {_sn_grp_name} "
-                    f"contains {len(_sn_tokens)} port token(s).",
-                    NOTE_CAT_GENERATED,
-                ))
+                if len(_sn_tokens) > PORT_ONLY_NS_THRESHOLD:
+                    _sn_grp_name       = f"svc-grp-{rule_name}-NS-{sn_app}"
+                    _sn_svc_for_design = _sn_grp_name
+                    svc_grp_rows.append({
+                        "type":         "service_group",
+                        "name":         _sn_grp_name,
+                        "device_group": device_group,
+                        "protocol":     "",
+                        "port":         "",
+                        "members":      "|".join(_sn_tokens),
+                        "rules":        rule_name,
+                    })
+                    notes.append((
+                        f"Design {sn_num} — {rule_name}",
+                        f"port-only NS rule (Application=any); service group {_sn_grp_name} "
+                        f"contains {len(_sn_tokens)} port token(s).",
+                        NOTE_CAT_GENERATED,
+                    ))
+                else:
+                    _sn_svc_for_design = _sn_svc
             else:
                 _sn_apps_for_design = [sn_app]
                 _sn_svc_for_design  = _sn_svc
@@ -2251,9 +2257,12 @@ def main() -> None:
                     sn_ports, ports_raw, svc_port_map, svc_group_map
                 )
                 _sn_tokens_c = [t.strip() for t in _sn_svc_c.split(" | ") if t.strip()]
-                if args.port_only_ns and len(_sn_tokens_c) > PORT_ONLY_NS_THRESHOLD:
+                if args.port_only_ns:
                     _sn_apps_csv = ["any"]
-                    _sn_svc_csv  = f"svc-grp-{rule_name}-NS-{sn_app}"
+                    if len(_sn_tokens_c) > PORT_ONLY_NS_THRESHOLD:
+                        _sn_svc_csv = f"svc-grp-{rule_name}-NS-{sn_app}"
+                    else:
+                        _sn_svc_csv = _sn_svc_c
                 else:
                     _sn_apps_csv = [sn_app]
                     _sn_svc_csv  = _sn_svc_c
