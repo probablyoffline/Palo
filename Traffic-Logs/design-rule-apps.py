@@ -132,7 +132,7 @@ requests.packages.urllib3.disable_warnings()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-__version__ = "1.11.30"
+__version__ = "1.11.31"
 
 APP_REVIEW_THRESHOLD     = 10  # flag designs with this many or more usable apps
 APP_FETCH_BATCH          = 50  # max apps per XPath filter to avoid PAN-OS XPath length limits
@@ -1316,6 +1316,15 @@ def format_addr_update_design(
             f"  (replaces {orig_dst_count} individual address object(s))"
         )
     return "\n".join(lines)
+
+
+def format_svc_group_design(name: str, device_group: str, members: list[str]) -> str:
+    return "\n".join([
+        "In [svc_group_dg]",
+        "Create service group",
+        f"Service Group Name: {name}",
+        f"Service Objects: {', '.join(members)}",
+    ])
 
 
 def format_addr_group_design(name: str, device_group: str, members: list[str]) -> str:
@@ -2597,6 +2606,20 @@ def main() -> None:
         sections.append(_section_header("PCI — NEW RULES") + "\n\n" + "\n\n---\n\n".join(new_rule_designs_pci))
     if update_designs_pci:
         sections.append(_section_header("PCI — RULE UPDATES") + "\n\n" + "\n\n---\n\n".join(update_designs_pci))
+    if svc_grp_rows:
+        _svc_grp_designs = [
+            format_svc_group_design(
+                name=r["name"],
+                device_group=r["device_group"],
+                members=[m.strip() for m in r["members"].split("|") if m.strip()],
+            )
+            for r in svc_grp_rows
+        ]
+        sections.append(
+            _section_header("SERVICE GROUP DEFINITIONS")
+            + "\n\n"
+            + "\n\n---\n\n".join(_svc_grp_designs)
+        )
     if addr_grp_rows:
         _addr_designs = [
             format_addr_group_design(
