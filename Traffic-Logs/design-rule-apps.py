@@ -132,7 +132,7 @@ requests.packages.urllib3.disable_warnings()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-__version__ = "1.11.27"
+__version__ = "1.11.28"
 
 APP_REVIEW_THRESHOLD     = 10  # flag designs with this many or more usable apps
 APP_FETCH_BATCH          = 50  # max apps per XPath filter to avoid PAN-OS XPath length limits
@@ -1288,6 +1288,34 @@ def _tag_matches_patterns(tags: list[str], patterns: list[str]) -> str | None:
     return None
 
 
+def format_addr_update_design(
+    design_number:  int | str,
+    rule_name:      str,
+    device_group:   str,
+    src_group:      str | None,
+    dst_group:      str | None,
+    orig_src_count: int,
+    orig_dst_count: int,
+) -> str:
+    lines = [
+        f"Design {design_number}", "",
+        f"In {device_group}",
+        "Update existing rule",
+        f"Rule Name: APP-ID-{rule_name}",
+    ]
+    if src_group:
+        lines.append(
+            f"Source Address: {src_group}"
+            f"  (replaces {orig_src_count} individual address object(s))"
+        )
+    if dst_group:
+        lines.append(
+            f"Dest Address: {dst_group}"
+            f"  (replaces {orig_dst_count} individual address object(s))"
+        )
+    return "\n".join(lines)
+
+
 def format_addr_group_design(name: str, device_group: str, members: list[str]) -> str:
     return "\n".join([
         "In [host_group_dg]",
@@ -1647,6 +1675,7 @@ def main() -> None:
     nonstandard_rule_count     = 0
     risky_rule_count           = 0
     app_update_count           = 0
+    addr_update_count          = 0
     update_count               = 0
     unused_count               = 0
     named_service_count        = 0
@@ -1787,6 +1816,8 @@ def main() -> None:
 
         # ── Address group substitution ────────────────────────────────────────
         _config = config  # replaced by a dataclass copy when --host-groups groups addresses
+        _addr_grp_src: str | None = None
+        _addr_grp_dst: str | None = None
         if args.host_groups:
             _new_src = config.source_addrs
             _new_dst = config.dest_addrs
@@ -1802,6 +1833,7 @@ def main() -> None:
                     "rules":        rule_name,
                 })
                 _new_src = [_src_grp]
+                _addr_grp_src = _src_grp
             if len(config.dest_addrs) >= HOST_GROUP_THRESHOLD:
                 _dst_grp = _addr_group_name(rule_name, "-dst")
                 addr_grp_rows.append({
@@ -1814,6 +1846,7 @@ def main() -> None:
                     "rules":        rule_name,
                 })
                 _new_dst = [_dst_grp]
+                _addr_grp_dst = _dst_grp
             if _new_src is not config.source_addrs or _new_dst is not config.dest_addrs:
                 _config = replace(config, source_addrs=_new_src, dest_addrs=_new_dst)
 
@@ -1889,6 +1922,7 @@ def main() -> None:
         known_num           = None
         unknown_num         = None
         app_update_num      = None
+        addr_update_num     = None
         nonstandard_num     = None
         nonstandard_upd_num = None
         risky_num           = None
@@ -1948,6 +1982,14 @@ def main() -> None:
                 design_count += 1; risky_num = design_count
                 risky_rule_count += 1
 
+        if args.host_groups and known_exists and (_addr_grp_src or _addr_grp_dst):
+            if pci:
+                pci_design_count += 1; addr_update_num = f"PCI-{pci_design_count}"
+                pci_update_count += 1
+            else:
+                design_count += 1; addr_update_num = design_count
+                addr_update_count += 1
+
         if pci:
             pci_design_count += 1; update_num = f"PCI-{pci_design_count}"
             pci_update_count += 1
@@ -1958,9 +2000,10 @@ def main() -> None:
         # ── Notes ─────────────────────────────────────────────────────────────
         first_num = (known_num           if known_num           is not None else
                      app_update_num      if app_update_num      is not None else
+                     addr_update_num     if addr_update_num     is not None else
                      unknown_num         if unknown_num         is not None else
                      nonstandard_num     if nonstandard_num     is not None else
-                     risky_num          if risky_num           is not None else
+                     risky_num           if risky_num           is not None else
                      update_num)
 
         if not config.found:
@@ -2112,6 +2155,13 @@ def main() -> None:
                 f"{len(main_apps)} apps — manual review recommended before finalizing this design.",
                 NOTE_CAT_REVIEW,
             ))
+        if addr_update_num is not None:
+            notes.append((
+                f"Design {addr_update_num} — {rule_name}",
+                f"APP-ID-{rule_name} already exists — address group substitution required "
+                f"(--host-groups). Update the deployed rule to use the new group(s).",
+                NOTE_CAT_EXISTING,
+            ))
 
         # ── Generate design blocks ────────────────────────────────────────────
         _new_designs = new_rule_designs_pci if pci else new_rule_designs
@@ -2144,6 +2194,17 @@ def main() -> None:
                     f"APP-ID-{rule_name} already has all observed apps — no update needed.",
                     NOTE_CAT_EXISTING,
                 ))
+
+        if addr_update_num is not None:
+            _upd_designs.append(format_addr_update_design(
+                design_number  = addr_update_num,
+                rule_name      = rule_name,
+                device_group   = device_group,
+                src_group      = _addr_grp_src,
+                dst_group      = _addr_grp_dst,
+                orig_src_count = len(config.source_addrs),
+                orig_dst_count = len(config.dest_addrs),
+            ))
 
         if generate_unknown:
             _new_designs.append(format_unknown_rule_design(
@@ -2585,6 +2646,8 @@ def main() -> None:
         print(f"  PCI: {pci_design_count} design(s)"
               f"  |  {pci_new_rule_count} new rule(s)"
               f"  |  {pci_update_count} tag update(s)")
+    if addr_update_count:
+        print(f"  {addr_update_count} address update(s) for deployed rules (--host-groups)")
     if named_service_count:
         print(f"  {named_service_count} rule(s) with named service objects (→ application-default)")
     print(f"  Text : {txt_path}")
