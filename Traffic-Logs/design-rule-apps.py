@@ -132,7 +132,7 @@ requests.packages.urllib3.disable_warnings()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-__version__ = "1.11.29"
+__version__ = "1.11.30"
 
 APP_REVIEW_THRESHOLD     = 10  # flag designs with this many or more usable apps
 APP_FETCH_BATCH          = 50  # max apps per XPath filter to avoid PAN-OS XPath length limits
@@ -400,6 +400,7 @@ def _parse_app_ports_to_set(entry: ET.Element) -> set[str]:
     Extract default ports from a PAN-OS app entry element.
     Handles the following member formats:
       'tcp/80'       → tcp-80
+      'tcp/80,443'   → tcp-80, tcp-443  (protocol prefix with comma-separated ports)
       'udp/443-445'  → udp-443, udp-444, udp-445  (range with protocol)
       '80'           → tcp-80, udp-80  (bare number; assumes both protocols)
       '443,80,udp'   → udp-443, udp-80  (comma-separated ports + protocol name)
@@ -437,8 +438,14 @@ def _parse_app_ports_to_set(entry: ET.Element) -> set[str]:
             continue
         text = member.text.strip().lower()
 
-        if "," in text:
-            # Comma-separated list of port numbers / ranges / protocol names.
+        if "/" in text:
+            # proto/port, proto/start-end, or proto/port1,port2 (e.g. "tcp/80,443")
+            proto, port_spec = text.split("/", 1)
+            if proto in _PROTOS:
+                for pt in [s.strip() for s in port_spec.split(",") if s.strip()]:
+                    _add_port_spec(proto, pt)
+        elif "," in text:
+            # Comma-separated list without a protocol prefix.
             # e.g. "443,80,udp"  →  protos=["udp"], ports=["443","80"]
             tokens = [t.strip() for t in text.split(",") if t.strip()]
             protos = [t for t in tokens if t in _PROTOS]
@@ -448,11 +455,6 @@ def _parse_app_ports_to_set(entry: ET.Element) -> set[str]:
             for pt in port_tokens:
                 for proto in protos:
                     _add_port_spec(proto, pt)
-        elif "/" in text:
-            # proto/port or proto/start-end
-            proto, port_spec = text.split("/", 1)
-            if proto in _PROTOS:
-                _add_port_spec(proto, port_spec)
         elif text in _PROTOS:
             # Bare protocol name with no port — can't enumerate, skip.
             pass
