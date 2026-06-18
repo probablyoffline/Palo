@@ -132,7 +132,7 @@ requests.packages.urllib3.disable_warnings()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-__version__ = "1.11.28"
+__version__ = "1.11.29"
 
 APP_REVIEW_THRESHOLD     = 10  # flag designs with this many or more usable apps
 APP_FETCH_BATCH          = 50  # max apps per XPath filter to avoid PAN-OS XPath length limits
@@ -2108,6 +2108,16 @@ def main() -> None:
                 f"separate NS rule generated.",
                 NOTE_CAT_GENERATED,
             ))
+            if nonst_app_ports:
+                _app_port_lines = "; ".join(
+                    f"{app} ({', '.join(sorted(ports))})"
+                    for app, ports in sorted(nonst_app_ports.items())
+                )
+                notes.append((
+                    f"Design {nonstandard_num} — {rule_name}",
+                    f"NS apps observed: {_app_port_lines}",
+                    NOTE_CAT_GENERATED,
+                ))
         for sn_app, sn_ports, sn_num in split_ns_nums:
             sn_detail = (f"{len(sn_ports)}+ ports" if len(sn_ports) > 10
                          else ', '.join(sorted(sn_ports)))
@@ -2115,6 +2125,11 @@ def main() -> None:
                 f"Design {sn_num} — {rule_name}",
                 f"split NS rule for {sn_app}: {sn_detail} — "
                 f"separate NS-{sn_app} rule generated.",
+                NOTE_CAT_GENERATED,
+            ))
+            notes.append((
+                f"Design {sn_num} — {rule_name}",
+                f"NS apps observed: {sn_app} ({', '.join(sorted(sn_ports))})",
                 NOTE_CAT_GENERATED,
             ))
         if risky_exists and risky_app_list:
