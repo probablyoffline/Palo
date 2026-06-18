@@ -132,7 +132,7 @@ requests.packages.urllib3.disable_warnings()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-__version__ = "1.11.31"
+__version__ = "1.11.32"
 
 APP_REVIEW_THRESHOLD     = 10  # flag designs with this many or more usable apps
 APP_FETCH_BATCH          = 50  # max apps per XPath filter to avoid PAN-OS XPath length limits
@@ -1327,6 +1327,22 @@ def format_svc_group_design(name: str, device_group: str, members: list[str]) ->
     ])
 
 
+def format_svc_group_update_design(
+    design_number:  int | str,
+    rule_name:      str,
+    device_group:   str,
+    svc_grp_name:   str,
+    new_tokens:     list[str],
+) -> str:
+    return "\n".join([
+        f"Design {design_number}", "",
+        f"In {device_group}",
+        "Update service group",
+        f"Service Group Name: {svc_grp_name}",
+        f"Add Service Objects: {', '.join(new_tokens)}",
+    ])
+
+
 def format_addr_group_design(name: str, device_group: str, members: list[str]) -> str:
     return "\n".join([
         "In [host_group_dg]",
@@ -2101,7 +2117,7 @@ def main() -> None:
             if args.update_existing:
                 notes.append((
                     f"Design {nonstandard_upd_num} — {rule_name}",
-                    f"APP-ID-{rule_name}-NS already exists — app_update design generated.",
+                    f"APP-ID-{rule_name}-NS already exists — update design generated.",
                     NOTE_CAT_EXISTING,
                 ))
             else:
@@ -2299,22 +2315,58 @@ def main() -> None:
                 base_tags      = base_existing_tags,
             ))
         elif nonstandard_upd_num is not None:
-            _deployed_ns_apps = {a.lower() for a in configs[f"APP-ID-{rule_name}-NS"].applications}
-            _new_ns_apps = [a for a in nonst_apps if a.lower() not in _deployed_ns_apps]
-            if _new_ns_apps:
-                _upd_designs.append(format_app_update_design(
-                    design_number = nonstandard_upd_num,
-                    rule_name     = rule_name,
-                    usable_apps   = _new_ns_apps,
-                    device_group  = device_group,
-                    rule_suffix   = "-NS",
-                ))
+            _ns_deployed_cfg = configs[f"APP-ID-{rule_name}-NS"]
+            _ns_svc_grp_name = f"svc-grp-{rule_name}-NS"
+            _ns_uses_svc_grp = any(
+                s.lower() == _ns_svc_grp_name.lower()
+                for s in _ns_deployed_cfg.service
+            )
+            if args.port_only_ns and _ns_uses_svc_grp:
+                _ns_svc_upd, _ns_missing_upd = consolidate_ns_service(
+                    nonst_ports, ports_raw, svc_port_map, svc_group_map
+                )
+                missing_svc_groups |= _ns_missing_upd
+                for _grp in _ns_missing_upd:
+                    missing_svc_rules.setdefault(_grp, set()).add(rule_name)
+                _ns_upd_tokens  = [t.strip() for t in _ns_svc_upd.split(" | ") if t.strip()]
+                _existing_mbrs  = {m.lower() for m in svc_group_map.get(_ns_svc_grp_name, [])}
+                _new_svc_tokens = [t for t in _ns_upd_tokens if t.lower() not in _existing_mbrs]
+                if _new_svc_tokens:
+                    for _tok in _new_svc_tokens:
+                        _m = _RAW_SINGLE_PORT_RE.match(_tok)
+                        if _m and _tok.lower() not in _svc_covered:
+                            missing_svc_objects[_tok] = (_m.group(1), _m.group(2))
+                            missing_svc_rules.setdefault(_tok, set()).add(rule_name)
+                    _upd_designs.append(format_svc_group_update_design(
+                        design_number = nonstandard_upd_num,
+                        rule_name     = rule_name,
+                        device_group  = device_group,
+                        svc_grp_name  = _ns_svc_grp_name,
+                        new_tokens    = _new_svc_tokens,
+                    ))
+                else:
+                    notes.append((
+                        f"Design {nonstandard_upd_num} — {rule_name}",
+                        f"Service group {_ns_svc_grp_name} already covers all observed NS ports — no update needed.",
+                        NOTE_CAT_EXISTING,
+                    ))
             else:
-                notes.append((
-                    f"Design {nonstandard_upd_num} — {rule_name}",
-                    f"APP-ID-{rule_name}-NS already has all observed apps — no update needed.",
-                    NOTE_CAT_EXISTING,
-                ))
+                _deployed_ns_apps = {a.lower() for a in _ns_deployed_cfg.applications}
+                _new_ns_apps = [a for a in nonst_apps if a.lower() not in _deployed_ns_apps]
+                if _new_ns_apps:
+                    _upd_designs.append(format_app_update_design(
+                        design_number = nonstandard_upd_num,
+                        rule_name     = rule_name,
+                        usable_apps   = _new_ns_apps,
+                        device_group  = device_group,
+                        rule_suffix   = "-NS",
+                    ))
+                else:
+                    notes.append((
+                        f"Design {nonstandard_upd_num} — {rule_name}",
+                        f"APP-ID-{rule_name}-NS already has all observed apps — no update needed.",
+                        NOTE_CAT_EXISTING,
+                    ))
 
         for sn_app, sn_ports, sn_num in split_ns_nums:
             _sn_svc, _sn_missing = consolidate_ns_service(
@@ -2452,7 +2504,10 @@ def main() -> None:
                     "tags_to_add":      "",
                 })
             elif nonstandard_upd_num is not None:
-                _csv.append(build_app_update_row(rule_name, nonst_apps, device_group, rule_suffix="-NS"))
+                if not (args.port_only_ns and _ns_uses_svc_grp):
+                    _csv.append(build_app_update_row(rule_name, nonst_apps, device_group, rule_suffix="-NS"))
+                # port_only_ns + svc_grp path: new service objects already
+                # added to missing_svc_objects in the text-design block above
 
             for sn_app, sn_ports, sn_num in split_ns_nums:
                 sn_tags = list(base_existing_tags) + [TAG_NEW_RULE, TAG_NON_STANDARD]
