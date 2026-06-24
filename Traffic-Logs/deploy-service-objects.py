@@ -51,7 +51,7 @@ import ops_lib  # noqa: E402
 
 requests.packages.urllib3.disable_warnings()
 
-__version__ = "1.0.8"
+__version__ = "1.0.9"
 
 SEP  = "=" * 62
 DASH = "-" * 62
@@ -59,7 +59,7 @@ DASH = "-" * 62
 _PRINT_LOCK = threading.Lock()
 
 # Matches the protocol+port suffix in service object names: e.g. svc-rule-tcp-443 or svc-rule-udp-514-515
-_SVC_NAME_RE = re.compile(r'-(tcp|udp)-(\d[\d\-]*)$', re.IGNORECASE)
+_SVC_NAME_RE = re.compile(r'(tcp|udp)[_\-](\d[\d\-]*)$', re.IGNORECASE)
 
 _MISSING_CSV_FIELDS = ["type", "name", "device_group", "protocol", "port", "members"]
 
