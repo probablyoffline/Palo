@@ -50,7 +50,7 @@ import ops_lib  # noqa: E402
 
 requests.packages.urllib3.disable_warnings()
 
-__version__ = "1.0.5"
+__version__ = "1.0.6"
 
 SEP  = "=" * 62
 DASH = "-" * 62
@@ -113,6 +113,29 @@ def _object_exists(xpath: str) -> bool:
         return root.get("status") == "success" and root.find(".//entry") is not None
     except Exception:
         return False
+
+
+def _fetch_existing_service_names(device_group: str, use_shared: bool) -> set[str]:
+    """Fetch all existing service object names from Panorama in one API call."""
+    if use_shared or ops_lib.MODE != "panorama":
+        if ops_lib.MODE == "panorama":
+            xpath = "/config/shared/service"
+        else:
+            dev  = "/config/devices/entry[@name='localhost.localdomain']"
+            vsys = f"/vsys/entry[@name='{ops_lib.VSYS}']"
+            xpath = f"{dev}{vsys}/service"
+    else:
+        dg    = device_group or ops_lib.DEVICE_GROUP
+        xpath = (
+            f"/config/devices/entry[@name='localhost.localdomain']"
+            f"/device-group/entry[@name='{dg}']/service"
+        )
+    try:
+        xml_text = ops_lib.api_get(xpath)
+        root     = ET.fromstring(xml_text)
+        return {e.get("name") for e in root.iter("entry") if e.get("name")}
+    except Exception:
+        return set()
 
 
 # ── Per-row worker ────────────────────────────────────────────────────────────
@@ -188,15 +211,12 @@ def _process_group_row(
             print(f"  SKIP  {name}  — empty members list")
         return "invalid", name, "empty members list"
 
-    missing = [m for m in members if m not in available_objects]
-    if missing:
-        truly_missing = [m for m in missing
-                         if not _object_exists(_service_xpath(m, dg, use_shared))]
-        if truly_missing:
-            msg = f"members not in Panorama: {', '.join(truly_missing)}"
-            with _PRINT_LOCK:
-                print(f"  BLOCKED  {name}  — {msg}")
-            return "blocked", name, msg
+    truly_missing = [m for m in members if m not in available_objects]
+    if truly_missing:
+        msg = f"members not in Panorama: {', '.join(truly_missing)}"
+        with _PRINT_LOCK:
+            print(f"  BLOCKED  {name}  — {msg}")
+        return "blocked", name, msg
 
     xpath = _service_group_xpath(name, dg, use_shared)
 
@@ -308,6 +328,12 @@ def main() -> None:
     results_path = f"Output/deploy-{stem}-{run_ts}-results.txt"
     os.makedirs("Output", exist_ok=True)
 
+    # ── Pre-load existing service objects (one bulk API call) ────────────────
+    print("  Fetching existing service objects...", end=" ", flush=True)
+    available_objects: set[str] = _fetch_existing_service_names(ops_lib.DEVICE_GROUP, args.shared)
+    print(f"{len(available_objects)} found")
+    print()
+
     # ── Pass 1: service objects (parallel) ────────────────────────────────────
     print(SEP)
     svc_results: list[tuple[str, str, str]] = []
@@ -317,10 +343,9 @@ def main() -> None:
             for f in as_completed(futures):
                 svc_results.append(f.result())
 
-    available_objects: set[str] = {
-        name for status, name, _ in svc_results
-        if status in ("created", "exists") and name
-    }
+    for status, name, _ in svc_results:
+        if status == "created" and name:
+            available_objects.add(name)
 
     # ── Pass 2: service groups (sequential — depend on objects from pass 1) ───
     grp_results: list[tuple[str, str, str]] = []
@@ -337,6 +362,27 @@ def main() -> None:
     existed  = [(n, d) for s, n, d in all_results if s == "exists"]
     errors   = [(n, d) for s, n, d in all_results if s in ("failed", "blocked")]
     invalid  = [(n, d) for s, n, d in all_results if s == "invalid"]
+
+    # ── Supplemental missing-objects CSV ─────────────────────────────────────
+    BLOCKED_PREFIX   = "members not in Panorama: "
+    missing_names: list[str] = []
+    for status, name, detail in grp_results:
+        if status == "blocked" and detail.startswith(BLOCKED_PREFIX):
+            missing_names.extend(detail.removeprefix(BLOCKED_PREFIX).split(", "))
+
+    missing_csv_path: str = ""
+    unresolvable:     list[str] = []
+    if missing_names:
+        svc_row_by_name = {r.get("name", "").strip(): r for r in svc_rows}
+        missing_rows    = [svc_row_by_name[n] for n in missing_names if n in svc_row_by_name]
+        unresolvable    = [n for n in missing_names if n not in svc_row_by_name]
+        if missing_rows:
+            missing_csv_path = f"Output/deploy-{stem}-{run_ts}-missing.csv"
+            fieldnames = list(missing_rows[0].keys())
+            with open(missing_csv_path, "w", newline="", encoding="utf-8") as fh:
+                writer = csv.DictWriter(fh, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(missing_rows)
 
     # ── Summary ───────────────────────────────────────────────────────────────
     lines: list[str] = [SEP, "  Run Summary", SEP]
@@ -369,6 +415,18 @@ def main() -> None:
         lines.append("  Objects are in Panorama's candidate config.")
         lines.append("  Commit via Panorama UI or your standard commit workflow.")
         lines.append(SEP)
+
+    if missing_csv_path:
+        lines.append(f"  Missing objects — deploy these first, then re-run ({len(missing_names)}):")
+        for n in missing_names:
+            lines.append(f"    {n}")
+        lines.append(f"  Missing objects CSV: {missing_csv_path}")
+        if unresolvable:
+            lines.append(f"  Could not reconstruct (not in input CSV — add manually):")
+            for n in unresolvable:
+                lines.append(f"    {n}")
+        lines.append(SEP)
+
     lines.append(f"  Results saved: {results_path}")
     lines.append(SEP)
 
