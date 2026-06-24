@@ -44,6 +44,8 @@ Options:
 
 import argparse
 import csv
+import datetime
+import os
 import re
 import sys
 import threading
@@ -58,7 +60,7 @@ import ops_lib  # noqa: E402
 
 requests.packages.urllib3.disable_warnings()
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 SEP  = "=" * 62
 DASH = "-" * 62
@@ -141,8 +143,10 @@ def _object_exists(xpath: str) -> bool:
 
 # ── Per-row workers ───────────────────────────────────────────────────────────
 
-def _process_object_row(row: dict, use_shared: bool, dry_run: bool) -> str:
-    """Process one address_object CSV row. Returns 'created', 'skipped', or 'failed'."""
+def _process_object_row(row: dict, use_shared: bool, dry_run: bool) -> tuple[str, str, str]:
+    """Process one address_object CSV row. Returns (status, name, detail).
+    status: 'created' | 'exists' | 'invalid' | 'failed'
+    """
     name     = row.get("name", "").strip()
     dg       = ops_lib.DEVICE_GROUP
     atype    = row.get("address_type", "").strip()
@@ -152,7 +156,7 @@ def _process_object_row(row: dict, use_shared: bool, dry_run: bool) -> str:
     if not name or not value:
         with _PRINT_LOCK:
             print(f"  SKIP  {name or '(no name)'}  — missing required fields (name/value)")
-        return "skipped"
+        return "invalid", name, "missing required fields"
 
     if not atype:
         atype, value = _detect_address_type(value)
@@ -162,12 +166,12 @@ def _process_object_row(row: dict, use_shared: bool, dry_run: bool) -> str:
     if _object_exists(xpath):
         with _PRINT_LOCK:
             print(f"  SKIP  {name}  — already exists")
-        return "skipped"
+        return "exists", name, ""
 
     if dry_run:
         with _PRINT_LOCK:
             print(f"  DRY-RUN  {name}  ({atype}: {value})  in {location}")
-        return "created"
+        return "created", name, f"{atype}: {value}"
 
     try:
         element = _address_object_xml(atype, value)
@@ -175,19 +179,21 @@ def _process_object_row(row: dict, use_shared: bool, dry_run: bool) -> str:
         if ops_lib.is_success(resp):
             with _PRINT_LOCK:
                 print(f"  CREATE  {name}  ({atype}: {value})  in {location}  ok")
-            return "created"
+            return "created", name, f"{atype}: {value}"
         else:
             with _PRINT_LOCK:
                 print(f"  FAILED  {name}  — {resp[:120]}")
-            return "failed"
+            return "failed", name, resp[:120]
     except Exception as exc:
         with _PRINT_LOCK:
             print(f"  FAILED  {name}  — {exc}")
-        return "failed"
+        return "failed", name, str(exc)
 
 
-def _process_group_row(row: dict, use_shared: bool, dry_run: bool) -> str:
-    """Process one address_group CSV row. Returns 'created', 'skipped', or 'failed'."""
+def _process_group_row(row: dict, use_shared: bool, dry_run: bool) -> tuple[str, str, str]:
+    """Process one address_group CSV row. Returns (status, name, detail).
+    status: 'created' | 'exists' | 'invalid' | 'failed'
+    """
     name        = row.get("name", "").strip()
     dg          = ops_lib.DEVICE_GROUP
     members_raw = row.get("members", "").strip()
@@ -196,25 +202,25 @@ def _process_group_row(row: dict, use_shared: bool, dry_run: bool) -> str:
     if not name or not members_raw:
         with _PRINT_LOCK:
             print(f"  SKIP  {name or '(no name)'}  — missing required fields (name/members)")
-        return "skipped"
+        return "invalid", name, "missing required fields"
 
     members = [m.strip() for m in members_raw.split("|") if m.strip()]
     if not members:
         with _PRINT_LOCK:
             print(f"  SKIP  {name}  — empty members list")
-        return "skipped"
+        return "invalid", name, "empty members list"
 
     xpath = _address_group_xpath(name, dg, use_shared)
 
     if _object_exists(xpath):
         with _PRINT_LOCK:
             print(f"  SKIP  {name}  — already exists")
-        return "skipped"
+        return "exists", name, ""
 
     if dry_run:
         with _PRINT_LOCK:
             print(f"  DRY-RUN  {name}  (address-group, {len(members)} member(s))  in {location}")
-        return "created"
+        return "created", name, f"address-group, {len(members)} member(s)"
 
     try:
         element = _address_group_xml(members)
@@ -222,15 +228,15 @@ def _process_group_row(row: dict, use_shared: bool, dry_run: bool) -> str:
         if ops_lib.is_success(resp):
             with _PRINT_LOCK:
                 print(f"  CREATE  {name}  (address-group, {len(members)} member(s))  in {location}  ok")
-            return "created"
+            return "created", name, f"address-group, {len(members)} member(s)"
         else:
             with _PRINT_LOCK:
                 print(f"  FAILED  {name}  — {resp[:120]}")
-            return "failed"
+            return "failed", name, resp[:120]
     except Exception as exc:
         with _PRINT_LOCK:
             print(f"  FAILED  {name}  — {exc}")
-        return "failed"
+        return "failed", name, str(exc)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -267,6 +273,8 @@ def main() -> None:
     if args.device_group:
         ops_lib.DEVICE_GROUP = args.device_group
         ops_lib.MODE = "panorama"
+
+    run_dt = datetime.datetime.now()
 
     print(SEP)
     print(f"  deploy-address-objects  v{__version__}")
@@ -307,40 +315,71 @@ def main() -> None:
         print(f"  {len(grp_rows)} address group(s) to process")
     print()
 
+    run_ts       = run_dt.strftime("%Y%m%d-%H%M%S")
+    stem         = Path(args.input_csv).stem
+    results_path = f"Output/deploy-{stem}-{run_ts}-results.txt"
+    os.makedirs("Output", exist_ok=True)
+
     # ── Pass 1: address objects (parallel) ────────────────────────────────────
     print(SEP)
-    statuses: list[str] = []
+    obj_results: list[tuple[str, str, str]] = []
     if obj_rows:
         with ThreadPoolExecutor(max_workers=args.workers) as ex:
             futures = [ex.submit(_process_object_row, row, args.shared, args.dry_run) for row in obj_rows]
             for f in as_completed(futures):
-                statuses.append(f.result())
+                obj_results.append(f.result())
 
     # ── Pass 2: address groups (sequential — depend on objects from pass 1) ───
-    grp_statuses: list[str] = []
+    grp_results: list[tuple[str, str, str]] = []
     if grp_rows:
         if obj_rows:
             print(SEP)
         for row in grp_rows:
-            grp_statuses.append(_process_group_row(row, args.shared, args.dry_run))
+            grp_results.append(_process_group_row(row, args.shared, args.dry_run))
 
-    created_count = statuses.count("created") + grp_statuses.count("created")
-    skipped_count = statuses.count("skipped") + grp_statuses.count("skipped")
-    failed_count  = statuses.count("failed")  + grp_statuses.count("failed")
+    all_results = obj_results + grp_results
+    created     = [(n, d) for s, n, d in all_results if s == "created"]
+    existed     = [(n, d) for s, n, d in all_results if s == "exists"]
+    errors      = [(n, d) for s, n, d in all_results if s == "failed"]
+    invalid     = [(n, d) for s, n, d in all_results if s == "invalid"]
 
     # ── Summary ───────────────────────────────────────────────────────────────
-    print(SEP)
-    if args.dry_run:
-        print(f"  Dry-run: {created_count} would be created, {skipped_count} already exist")
-    else:
-        print(f"  Created : {created_count}")
-        print(f"  Skipped : {skipped_count}  (already existed)")
-        print(f"  Failed  : {failed_count}")
-        if created_count:
-            print()
-            print("  Objects are in Panorama's candidate config.")
-            print("  Commit via Panorama UI or your standard commit workflow.")
-    print(SEP)
+    lines: list[str] = [SEP, "  Run Summary", SEP]
+
+    if created:
+        lines.append(f"  Created ({len(created)}):")
+        for name, detail in sorted(created):
+            lines.append(f"    {name:<40}  {detail}")
+        lines.append("")
+
+    skipped_all = existed + invalid
+    if skipped_all:
+        lines.append(f"  Skipped — already existed / invalid ({len(skipped_all)}):")
+        for name, detail in sorted(skipped_all):
+            label = f"  ({detail})" if detail else ""
+            lines.append(f"    {name}{label}")
+        lines.append("")
+
+    if errors:
+        lines.append(f"  Failed ({len(errors)}):")
+        for name, detail in errors:
+            lines.append(f"    {name:<40}  — {detail}")
+        lines.append("")
+
+    lines.append(
+        f"  Total: {len(created)} created, {len(skipped_all)} skipped, {len(errors)} failed"
+    )
+    lines.append(SEP)
+    if created and not args.dry_run:
+        lines.append("  Objects are in Panorama's candidate config.")
+        lines.append("  Commit via Panorama UI or your standard commit workflow.")
+        lines.append(SEP)
+    lines.append(f"  Results saved: {results_path}")
+    lines.append(SEP)
+
+    print("\n".join(lines))
+    with open(results_path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
 
 
 if __name__ == "__main__":

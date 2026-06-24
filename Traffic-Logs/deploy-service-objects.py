@@ -1,15 +1,23 @@
 """
-deploy-service-objects.py — Create service objects in Panorama from a design svc CSV
+deploy-service-objects.py — Create service objects and service groups in Panorama
 
 Reads the *-svc.csv file produced by design-rule-apps.py and creates any missing
-service objects in Panorama.  Run this before deploy-rule-design.py to ensure all
-service objects referenced in NS rule designs exist.
+service objects and service groups in Panorama.  Run this before deploy-rule-design.py
+to ensure all service objects referenced in NS rule designs exist.
+
+Supported row types in the svc CSV:
+  service_object  — Creates a single service object (TCP or UDP port/range).
+                    Columns used: name, device_group, protocol, port
+  service_group   — Creates a static service group.
+                    Columns used: name, device_group, members (pipe-separated member names)
 
 Execution flow:
   1. Load svc CSV
-  2. For each service_object row: check if it already exists, then create it
-  3. Print summary
-  4. If --dry-run: exit without changes
+  2. Pass 1 — service_object rows: check existence, create in parallel (--workers threads)
+  3. Pass 2 — service_group rows: check existence, create sequentially
+              (members from pass 1 must exist before groups can reference them)
+  4. Print summary
+  If --dry-run: print what would be created; make no changes
 
 Changes are left in Panorama's candidate config; commit via the Panorama UI or a
 separate commit step.
@@ -22,11 +30,13 @@ Options:
     --shared                          Create objects under /config/shared instead
                                       of the device group in each CSV row
     --dry-run                         Print what would be created; make no changes
+    --workers N                       Parallel threads for service objects (default: 4)
 """
 
 import argparse
 import csv
 import datetime
+import os
 import sys
 import threading
 import xml.etree.ElementTree as ET
@@ -40,7 +50,7 @@ import ops_lib  # noqa: E402
 
 requests.packages.urllib3.disable_warnings()
 
-__version__ = "1.0.4"
+__version__ = "1.0.5"
 
 SEP  = "=" * 62
 DASH = "-" * 62
@@ -107,8 +117,10 @@ def _object_exists(xpath: str) -> bool:
 
 # ── Per-row worker ────────────────────────────────────────────────────────────
 
-def _process_row(row: dict, use_shared: bool, dry_run: bool) -> str:
-    """Process one CSV row. Returns 'created', 'skipped', or 'failed'."""
+def _process_row(row: dict, use_shared: bool, dry_run: bool) -> tuple[str, str, str]:
+    """Process one CSV row. Returns (status, name, detail).
+    status: 'created' | 'exists' | 'invalid' | 'failed'
+    """
     name     = row.get("name", "").strip()
     dg       = ops_lib.DEVICE_GROUP
     protocol = row.get("protocol", "").strip()
@@ -118,19 +130,19 @@ def _process_row(row: dict, use_shared: bool, dry_run: bool) -> str:
     if not name or not protocol or not port:
         with _PRINT_LOCK:
             print(f"  SKIP  {name or '(no name)'}  — missing required fields")
-        return "skipped"
+        return "invalid", name, "missing required fields"
 
     xpath = _service_xpath(name, dg, use_shared)
 
     if _object_exists(xpath):
         with _PRINT_LOCK:
             print(f"  SKIP  {name}  — already exists")
-        return "skipped"
+        return "exists", name, ""
 
     if dry_run:
         with _PRINT_LOCK:
             print(f"  DRY-RUN  {name}  ({protocol}/{port})  in {location}")
-        return "created"
+        return "created", name, f"{protocol}/{port}"
 
     try:
         element = _service_xml(protocol, port)
@@ -138,48 +150,65 @@ def _process_row(row: dict, use_shared: bool, dry_run: bool) -> str:
         if ops_lib.is_success(resp):
             with _PRINT_LOCK:
                 print(f"  CREATE  {name}  ({protocol}/{port})  in {location}  ok")
-            return "created"
+            return "created", name, f"{protocol}/{port}"
         else:
             with _PRINT_LOCK:
                 print(f"  FAILED  {name}  — {resp[:120]}")
-            return "failed"
+            return "failed", name, resp[:120]
     except Exception as exc:
         with _PRINT_LOCK:
             print(f"  FAILED  {name}  — {exc}")
-        return "failed"
+        return "failed", name, str(exc)
 
 
 # ── Per-group worker ─────────────────────────────────────────────────────────
 
-def _process_group_row(row: dict, use_shared: bool, dry_run: bool) -> str:
-    """Process one service_group CSV row. Returns 'created', 'skipped', or 'failed'."""
-    name     = row.get("name", "").strip()
-    dg       = ops_lib.DEVICE_GROUP
+def _process_group_row(
+    row: dict,
+    use_shared: bool,
+    dry_run: bool,
+    available_objects: set[str],
+) -> tuple[str, str, str]:
+    """Process one service_group CSV row. Returns (status, name, detail).
+    status: 'created' | 'exists' | 'invalid' | 'blocked' | 'failed'
+    """
+    name        = row.get("name", "").strip()
+    dg          = ops_lib.DEVICE_GROUP
     members_raw = row.get("members", "").strip()
-    location = "shared" if use_shared else dg
+    location    = "shared" if use_shared else dg
 
     if not name or not members_raw:
         with _PRINT_LOCK:
             print(f"  SKIP  {name or '(no name)'}  — missing required fields (name/members)")
-        return "skipped"
+        return "invalid", name, "missing required fields"
 
     members = [m.strip() for m in members_raw.split("|") if m.strip()]
     if not members:
         with _PRINT_LOCK:
             print(f"  SKIP  {name}  — empty members list")
-        return "skipped"
+        return "invalid", name, "empty members list"
+
+    missing = [m for m in members if m not in available_objects]
+    if missing:
+        truly_missing = [m for m in missing
+                         if not _object_exists(_service_xpath(m, dg, use_shared))]
+        if truly_missing:
+            msg = f"members not in Panorama: {', '.join(truly_missing)}"
+            with _PRINT_LOCK:
+                print(f"  BLOCKED  {name}  — {msg}")
+            return "blocked", name, msg
 
     xpath = _service_group_xpath(name, dg, use_shared)
 
     if _object_exists(xpath):
         with _PRINT_LOCK:
             print(f"  SKIP  {name}  — already exists")
-        return "skipped"
+        return "exists", name, ""
 
     if dry_run:
         with _PRINT_LOCK:
             print(f"  DRY-RUN  {name}  (service-group, {len(members)} member(s))  in {location}")
-        return "created"
+        return "created", name, f"service-group, {len(members)} member(s)"
 
     try:
         element = _service_group_xml(members)
@@ -187,15 +216,15 @@ def _process_group_row(row: dict, use_shared: bool, dry_run: bool) -> str:
         if ops_lib.is_success(resp):
             with _PRINT_LOCK:
                 print(f"  CREATE  {name}  (service-group, {len(members)} member(s))  in {location}  ok")
-            return "created"
+            return "created", name, f"service-group, {len(members)} member(s)"
         else:
             with _PRINT_LOCK:
                 print(f"  FAILED  {name}  — {resp[:120]}")
-            return "failed"
+            return "failed", name, resp[:120]
     except Exception as exc:
         with _PRINT_LOCK:
             print(f"  FAILED  {name}  — {exc}")
-        return "failed"
+        return "failed", name, str(exc)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -274,40 +303,78 @@ def main() -> None:
         print(f"  {len(grp_rows)} service group(s) to process")
     print()
 
+    run_ts     = run_dt.strftime("%Y%m%d-%H%M%S")
+    stem       = Path(args.input_csv).stem
+    results_path = f"Output/deploy-{stem}-{run_ts}-results.txt"
+    os.makedirs("Output", exist_ok=True)
+
     # ── Pass 1: service objects (parallel) ────────────────────────────────────
     print(SEP)
-    statuses: list[str] = []
+    svc_results: list[tuple[str, str, str]] = []
     if svc_rows:
         with ThreadPoolExecutor(max_workers=args.workers) as ex:
             futures = [ex.submit(_process_row, row, args.shared, args.dry_run) for row in svc_rows]
             for f in as_completed(futures):
-                statuses.append(f.result())
+                svc_results.append(f.result())
+
+    available_objects: set[str] = {
+        name for status, name, _ in svc_results
+        if status in ("created", "exists") and name
+    }
 
     # ── Pass 2: service groups (sequential — depend on objects from pass 1) ───
-    grp_statuses: list[str] = []
+    grp_results: list[tuple[str, str, str]] = []
     if grp_rows:
         if svc_rows:
             print(SEP)
         for row in grp_rows:
-            grp_statuses.append(_process_group_row(row, args.shared, args.dry_run))
+            grp_results.append(
+                _process_group_row(row, args.shared, args.dry_run, available_objects)
+            )
 
-    created_count = statuses.count("created") + grp_statuses.count("created")
-    skipped_count = statuses.count("skipped") + grp_statuses.count("skipped")
-    failed_count  = statuses.count("failed")  + grp_statuses.count("failed")
+    all_results = svc_results + grp_results
+    created  = [(n, d) for s, n, d in all_results if s == "created"]
+    existed  = [(n, d) for s, n, d in all_results if s == "exists"]
+    errors   = [(n, d) for s, n, d in all_results if s in ("failed", "blocked")]
+    invalid  = [(n, d) for s, n, d in all_results if s == "invalid"]
 
     # ── Summary ───────────────────────────────────────────────────────────────
-    print(SEP)
-    if args.dry_run:
-        print(f"  Dry-run: {created_count} would be created, {skipped_count} already exist")
-    else:
-        print(f"  Created : {created_count}")
-        print(f"  Skipped : {skipped_count}  (already existed)")
-        print(f"  Failed  : {failed_count}")
-        if created_count:
-            print()
-            print("  Objects are in Panorama's candidate config.")
-            print("  Commit via Panorama UI or your standard commit workflow.")
-    print(SEP)
+    lines: list[str] = [SEP, "  Run Summary", SEP]
+
+    if created:
+        lines.append(f"  Created ({len(created)}):")
+        for name, detail in sorted(created):
+            lines.append(f"    {name:<40}  {detail}")
+        lines.append("")
+
+    skipped_all = existed + invalid
+    if skipped_all:
+        lines.append(f"  Skipped — already existed / invalid ({len(skipped_all)}):")
+        for name, detail in sorted(skipped_all):
+            label = f"  ({detail})" if detail else ""
+            lines.append(f"    {name}{label}")
+        lines.append("")
+
+    if errors:
+        lines.append(f"  Blocked / Failed ({len(errors)}):")
+        for name, detail in errors:
+            lines.append(f"    {name:<40}  — {detail}")
+        lines.append("")
+
+    lines.append(
+        f"  Total: {len(created)} created, {len(skipped_all)} skipped, {len(errors)} blocked/failed"
+    )
+    lines.append(SEP)
+    if created and not args.dry_run:
+        lines.append("  Objects are in Panorama's candidate config.")
+        lines.append("  Commit via Panorama UI or your standard commit workflow.")
+        lines.append(SEP)
+    lines.append(f"  Results saved: {results_path}")
+    lines.append(SEP)
+
+    print("\n".join(lines))
+    with open(results_path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
 
 
 if __name__ == "__main__":
