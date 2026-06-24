@@ -51,7 +51,7 @@ import ops_lib  # noqa: E402
 
 requests.packages.urllib3.disable_warnings()
 
-__version__ = "1.0.7"
+__version__ = "1.0.8"
 
 SEP  = "=" * 62
 DASH = "-" * 62
@@ -370,44 +370,32 @@ def main() -> None:
     invalid  = [(n, d) for s, n, d in all_results if s == "invalid"]
 
     # ── Supplemental missing-objects CSV ─────────────────────────────────────
-    BLOCKED_PREFIX   = "members not in Panorama: "
+    BLOCKED_PREFIX = "members not in Panorama: "
     missing_names: list[str] = []
     for status, name, detail in grp_results:
         if status == "blocked" and detail.startswith(BLOCKED_PREFIX):
-            missing_names.extend(detail.removeprefix(BLOCKED_PREFIX).split(", "))
+            missing_names.extend(
+                n.strip() for n in detail.removeprefix(BLOCKED_PREFIX).split(", ") if n.strip()
+            )
 
     missing_csv_path: str = ""
-    unresolvable:     list[str] = []
     if missing_names:
-        svc_row_by_name = {r.get("name", "").strip(): r for r in svc_rows}
         missing_rows: list[dict] = []
-
         for n in missing_names:
-            if n in svc_row_by_name:
-                missing_rows.append(svc_row_by_name[n])
-            else:
-                m = _SVC_NAME_RE.search(n)
-                if m:
-                    proto, port = m.group(1).lower(), m.group(2)
-                    missing_rows.append({
-                        "type":         "service_object",
-                        "name":         n,
-                        "device_group": ops_lib.DEVICE_GROUP,
-                        "protocol":     proto,
-                        "port":         port,
-                        "members":      "",
-                    })
-                else:
-                    unresolvable.append(n)
-
-        if missing_rows:
-            missing_csv_path = f"Output/deploy-{stem}-{run_ts}-missing.csv"
-            with open(missing_csv_path, "w", newline="", encoding="utf-8") as fh:
-                writer = csv.DictWriter(
-                    fh, fieldnames=_MISSING_CSV_FIELDS, extrasaction="ignore"
-                )
-                writer.writeheader()
-                writer.writerows(missing_rows)
+            m = _SVC_NAME_RE.search(n)
+            missing_rows.append({
+                "type":         "service_object",
+                "name":         n,
+                "device_group": ops_lib.DEVICE_GROUP,
+                "protocol":     m.group(1).lower() if m else "",
+                "port":         m.group(2)         if m else "",
+                "members":      "",
+            })
+        missing_csv_path = f"Output/deploy-{stem}-{run_ts}-missing.csv"
+        with open(missing_csv_path, "w", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=_MISSING_CSV_FIELDS, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(missing_rows)
 
     # ── Summary ───────────────────────────────────────────────────────────────
     lines: list[str] = [SEP, "  Run Summary", SEP]
@@ -446,10 +434,6 @@ def main() -> None:
         for n in missing_names:
             lines.append(f"    {n}")
         lines.append(f"  Missing objects CSV: {missing_csv_path}")
-        if unresolvable:
-            lines.append(f"  Could not reconstruct (not in input CSV — add manually):")
-            for n in unresolvable:
-                lines.append(f"    {n}")
         lines.append(SEP)
 
     lines.append(f"  Results saved: {results_path}")
