@@ -37,6 +37,7 @@ import argparse
 import csv
 import datetime
 import os
+import re
 import sys
 import threading
 import xml.etree.ElementTree as ET
@@ -50,12 +51,17 @@ import ops_lib  # noqa: E402
 
 requests.packages.urllib3.disable_warnings()
 
-__version__ = "1.0.6"
+__version__ = "1.0.7"
 
 SEP  = "=" * 62
 DASH = "-" * 62
 
 _PRINT_LOCK = threading.Lock()
+
+# Matches the protocol+port suffix in service object names: e.g. svc-rule-tcp-443 or svc-rule-udp-514-515
+_SVC_NAME_RE = re.compile(r'-(tcp|udp)-(\d[\d\-]*)$', re.IGNORECASE)
+
+_MISSING_CSV_FIELDS = ["type", "name", "device_group", "protocol", "port", "members"]
 
 
 # ── XPath helpers ─────────────────────────────────────────────────────────────
@@ -374,13 +380,32 @@ def main() -> None:
     unresolvable:     list[str] = []
     if missing_names:
         svc_row_by_name = {r.get("name", "").strip(): r for r in svc_rows}
-        missing_rows    = [svc_row_by_name[n] for n in missing_names if n in svc_row_by_name]
-        unresolvable    = [n for n in missing_names if n not in svc_row_by_name]
+        missing_rows: list[dict] = []
+
+        for n in missing_names:
+            if n in svc_row_by_name:
+                missing_rows.append(svc_row_by_name[n])
+            else:
+                m = _SVC_NAME_RE.search(n)
+                if m:
+                    proto, port = m.group(1).lower(), m.group(2)
+                    missing_rows.append({
+                        "type":         "service_object",
+                        "name":         n,
+                        "device_group": ops_lib.DEVICE_GROUP,
+                        "protocol":     proto,
+                        "port":         port,
+                        "members":      "",
+                    })
+                else:
+                    unresolvable.append(n)
+
         if missing_rows:
             missing_csv_path = f"Output/deploy-{stem}-{run_ts}-missing.csv"
-            fieldnames = list(missing_rows[0].keys())
             with open(missing_csv_path, "w", newline="", encoding="utf-8") as fh:
-                writer = csv.DictWriter(fh, fieldnames=fieldnames)
+                writer = csv.DictWriter(
+                    fh, fieldnames=_MISSING_CSV_FIELDS, extrasaction="ignore"
+                )
                 writer.writeheader()
                 writer.writerows(missing_rows)
 
