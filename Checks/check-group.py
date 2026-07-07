@@ -20,8 +20,8 @@ import os
 import sys
 import xml.etree.ElementTree as ET
 
-# ops_lib.py lives in the parent directory
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+# ops_lib.py lives in ../libs/
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "libs"))
 import ops_lib as lib  # noqa: E402
 
 VERSION = "1.0.0"
