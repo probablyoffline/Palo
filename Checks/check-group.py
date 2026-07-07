@@ -16,6 +16,8 @@ Examples:
 """
 
 import argparse
+import csv
+import datetime
 import os
 import sys
 import xml.etree.ElementTree as ET
@@ -24,7 +26,7 @@ import xml.etree.ElementTree as ET
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "libs"))
 import ops_lib as lib  # noqa: E402
 
-VERSION = "1.0.1"
+VERSION = "1.1.0"
 
 # ── XPath helpers ─────────────────────────────────────────────────────────────
 
@@ -146,6 +148,48 @@ def print_expanded(group_name: str, group_type: str, shared: bool) -> None:
             print(f"{indent}{name}")
 
 
+# ── Data collection (for file output) ────────────────────────────────────────
+
+def collect_flat(group_name: str, group_type: str, shared: bool) -> list[dict]:
+    members = get_group_members(group_name, group_type, shared) or []
+    return [{"group": group_name, "member": m} for m in members]
+
+
+def collect_expanded(group_name: str, group_type: str, shared: bool) -> list[dict]:
+    rows = []
+    for _depth, name, is_group, annotation in _expand(group_name, group_type, shared, 0, frozenset()):
+        if is_group:
+            continue
+        addr_type = value = ""
+        if annotation and ": " in annotation:
+            addr_type, value = annotation.split(": ", 1)
+        rows.append({"group": group_name, "member": name, "addr_type": addr_type, "value": value})
+    return rows
+
+
+def write_csv(rows: list[dict], filepath: str, multi_group: bool, expanded: bool) -> None:
+    if expanded:
+        fieldnames = ["group", "member", "addr_type", "value"]
+    elif multi_group:
+        fieldnames = ["group", "member"]
+    else:
+        fieldnames = ["member"]
+    with open(filepath, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def write_txt(rows: list[dict], filepath: str, multi_group: bool) -> None:
+    with open(filepath, "w", encoding="utf-8") as fh:
+        current_group = None
+        for row in rows:
+            if multi_group and row["group"] != current_group:
+                current_group = row["group"]
+                fh.write(f"# Group: {current_group}\n")
+            fh.write(row["member"] + "\n")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -167,6 +211,10 @@ def main() -> None:
         "--device-group", "--dg", metavar="NAME", dest="device_group",
         help="Override device group and force Panorama mode",
     )
+    parser.add_argument(
+        "--format", choices=["csv", "txt"], default="csv",
+        help="Output file format (default: csv)",
+    )
     args = parser.parse_args()
 
     if args.device_group:
@@ -184,6 +232,23 @@ def main() -> None:
             print_expanded(name, args.group_type, args.shared)
         else:
             print_flat(name, args.group_type, args.shared)
+
+    # ── File output ───────────────────────────────────────────────────────────
+    multi_group = len(args.names) > 1
+    all_rows: list[dict] = []
+    for name in args.names:
+        if args.expand:
+            all_rows.extend(collect_expanded(name, args.group_type, args.shared))
+        else:
+            all_rows.extend(collect_flat(name, args.group_type, args.shared))
+
+    ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    outfile = f"check-group-{ts}.{args.format}"
+    if args.format == "csv":
+        write_csv(all_rows, outfile, multi_group, args.expand)
+    else:
+        write_txt(all_rows, outfile, multi_group)
+    print(f"\nOutput : {outfile}  ({len(all_rows)} rows)")
 
 
 if __name__ == "__main__":
