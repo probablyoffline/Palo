@@ -24,7 +24,7 @@ import xml.etree.ElementTree as ET
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "libs"))
 import ops_lib as lib  # noqa: E402
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 
 # ── XPath helpers ─────────────────────────────────────────────────────────────
 
@@ -36,17 +36,14 @@ _GROUP_SUFFIX = {
 
 
 def _group_xpath(name: str, group_type: str, shared: bool) -> str:
-    if shared or lib.MODE == "panorama":
-        base = "/config/shared"
-    else:
-        base = lib._config_base()
+    base = "/config/shared" if shared else lib._config_base()
     return f"{base}/{_GROUP_SUFFIX[group_type]}/entry[@name='{name}']"
 
 
 def _address_xpath(name: str, shared: bool) -> str:
-    if shared or lib.MODE == "panorama":
+    if shared:
         return f"/config/shared/address/entry[@name='{name}']"
-    return lib.address_xpath(name)
+    return f"{lib._config_base()}/address/entry[@name='{name}']"
 
 
 # ── Fetch helpers ─────────────────────────────────────────────────────────────
