@@ -31,7 +31,7 @@ import xml.etree.ElementTree as ET
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "libs"))
 import ops_lib as lib  # noqa: E402
 
-VERSION = "1.2.0"
+VERSION = "1.4.1"
 
 _IP_RE = re.compile(r'^\d{1,3}(\.\d{1,3}){3}$')
 
@@ -92,7 +92,8 @@ def resolve_address_object(name: str, shared: bool) -> str | None:
 
 # ── Expand (recursive) ────────────────────────────────────────────────────────
 
-def _expand(name: str, group_type: str, shared: bool, depth: int, seen: frozenset):
+def _expand(name: str, group_type: str, shared: bool, depth: int, seen: frozenset,
+            verbose: bool = False):
     """
     Yield (depth, member_name, is_group, annotation) tuples.
     `is_group=True` means this line is itself a nested group header.
@@ -103,75 +104,101 @@ def _expand(name: str, group_type: str, shared: bool, depth: int, seen: frozense
 
     for member in members:
         if member in seen:
+            if verbose:
+                indent = "  " * depth
+                print(f"    {indent}{member}  [circular reference — skipped]", flush=True)
             yield (depth, member, False, "[circular reference — skipped]")
             continue
 
         sub_members = get_group_members(member, group_type, shared)
         if sub_members is not None:
+            if verbose:
+                indent = "  " * depth
+                print(f"    {indent}{member}  [nested group — expanding]", flush=True)
             yield (depth, member, True, None)
-            yield from _expand(member, group_type, shared, depth + 1, seen | {name})
+            yield from _expand(member, group_type, shared, depth + 1, seen | {name}, verbose)
         else:
             annotation = None
             if group_type == "address":
                 annotation = resolve_address_object(member, shared)
+            if verbose:
+                indent = "  " * depth
+                val_str = f"  ({annotation})" if annotation else ""
+                print(f"    {indent}{member:<40}{val_str}", flush=True)
             yield (depth, member, False, annotation)
 
 
 # ── Data collection ───────────────────────────────────────────────────────────
 
-def collect_members(group_name: str, group_type: str, shared: bool) -> list[dict]:
+def collect_members(group_name: str, group_type: str, shared: bool,
+                    verbose: bool = False) -> list[dict]:
     """
     Collect all leaf members with resolved values (flat — no tree structure).
     Returns list of {group, member, addr_type, value} dicts.
     """
+    if verbose:
+        print(f"  Fetching {group_name}...", flush=True)
     rows = []
-    for _depth, name, is_group, annotation in _expand(group_name, group_type, shared, 0, frozenset()):
+    for _depth, name, is_group, annotation in _expand(group_name, group_type, shared, 0, frozenset(), verbose):
         if is_group:
             continue
         addr_type = value = ""
         if annotation and ": " in annotation:
             addr_type, value = annotation.split(": ", 1)
         rows.append({"group": group_name, "member": name, "addr_type": addr_type, "value": value})
+    if verbose:
+        print(f"  {len(rows)} members resolved.", flush=True)
     return rows
 
 
 # ── Console output ────────────────────────────────────────────────────────────
 
-def print_flat(group_name: str, group_type: str, shared: bool) -> None:
-    members = get_group_members(group_name, group_type, shared)
+def print_flat(group_name: str, group_type: str, shared: bool,
+               verbose: bool = False) -> list[dict]:
+    """Display flat member list and return collected rows for file output."""
     label = group_type.capitalize() + " Group"
+    rows = collect_members(group_name, group_type, shared, verbose)
     print(f"{label}: {group_name}")
-    if members is None:
-        print("  [not found]")
-        return
-    if not members:
-        print("  [empty group]")
-        return
-    rows = collect_members(group_name, group_type, shared)
-    for row in rows:
-        annotation = f"({row['addr_type']}: {row['value']})" if row["value"] else ""
-        print(f"  {row['member']:<40} {annotation}")
+    if not rows:
+        members = get_group_members(group_name, group_type, shared)
+        print("  [not found]" if members is None else "  [empty group]")
+    else:
+        for row in rows:
+            annotation = f"({row['addr_type']}: {row['value']})" if row["value"] else ""
+            print(f"  {row['member']:<40} {annotation}")
+    return rows
 
 
-def print_expanded(group_name: str, group_type: str, shared: bool) -> None:
-    members = get_group_members(group_name, group_type, shared)
+def print_expanded(group_name: str, group_type: str, shared: bool,
+                   verbose: bool = False) -> list[dict]:
+    """Display tree-structured member list and return leaf rows for file output."""
     label = group_type.capitalize() + " Group"
+    members = get_group_members(group_name, group_type, shared)
     print(f"{label}: {group_name}  [expanded]")
     if members is None:
         print("  [not found]")
-        return
+        return []
     if not members:
         print("  [empty group]")
-        return
+        return []
 
-    for depth, name, is_group, annotation in _expand(group_name, group_type, shared, 0, frozenset()):
+    if verbose:
+        print(f"  Fetching {group_name}...", flush=True)
+    leaf_rows: list[dict] = []
+    for depth, name, is_group, annotation in _expand(group_name, group_type, shared, 0, frozenset(), verbose):
         indent = "  " + "    " * depth
         if is_group:
             print(f"{indent}{name}  [group]")
         elif annotation:
             print(f"{indent}{name:<40} ({annotation})")
+            addr_type, value = ("", "")
+            if ": " in annotation:
+                addr_type, value = annotation.split(": ", 1)
+            leaf_rows.append({"group": group_name, "member": name, "addr_type": addr_type, "value": value})
         else:
             print(f"{indent}{name}")
+            leaf_rows.append({"group": group_name, "member": name, "addr_type": "", "value": ""})
+    return leaf_rows
 
 
 # ── File output ───────────────────────────────────────────────────────────────
@@ -258,6 +285,7 @@ def run_compare(
     input_list: list[str],
     group_type: str,
     shared: bool,
+    verbose: bool = False,
 ) -> tuple[list[tuple[str, dict]], list[str]]:
     """
     Compare input_list against the group's resolved member values.
@@ -265,11 +293,18 @@ def run_compare(
       found   = list of (input_entry, matched_row_dict)
       missing = list of raw input_entry strings
     """
-    rows = collect_members(group_name, group_type, shared)
+    if verbose:
+        print(f"  {len(input_list)} input entries loaded.", flush=True)
+        print(f"  Resolving group members...", flush=True)
+
+    rows = collect_members(group_name, group_type, shared, verbose)
     value_map: dict[str, dict] = {}
     for row in rows:
         if row["value"]:
             value_map[normalize_addr(row["value"])] = row
+
+    if verbose:
+        print(f"  Comparing {len(input_list)} input entries against {len(value_map)} group values...", flush=True)
 
     found: list[tuple[str, dict]] = []
     missing: list[str] = []
@@ -279,6 +314,9 @@ def run_compare(
             found.append((entry, value_map[norm]))
         else:
             missing.append(entry)
+
+    if verbose:
+        print(f"  Result: {len(found)} found, {len(missing)} missing.", flush=True)
 
     return found, missing
 
@@ -332,6 +370,90 @@ def write_deploy_csv(missing: list[str], filepath: str, device_group: str) -> No
             })
 
 
+# ── Diff mode (two-way comparison) ───────────────────────────────────────────
+
+def run_diff(
+    group_name: str,
+    input_list: list[str],
+    group_type: str,
+    shared: bool,
+    verbose: bool = False,
+) -> tuple[list[tuple[str, dict]], list[str], list[dict]]:
+    """
+    Full two-way diff between input_list and group members.
+    Returns (found, missing_from_group, extra_in_group) where:
+      found              = list of (input_entry, matched_row_dict)
+      missing_from_group = list of input_entry strings not in the group
+      extra_in_group     = list of row dicts for group members not in input_list
+    """
+    if verbose:
+        print(f"  {len(input_list)} input entries loaded.", flush=True)
+        print(f"  Resolving group members...", flush=True)
+
+    rows = collect_members(group_name, group_type, shared, verbose)
+    value_map: dict[str, dict] = {normalize_addr(r["value"]): r for r in rows if r["value"]}
+    norm_input: set[str] = {normalize_addr(e) for e in input_list}
+
+    if verbose:
+        print(f"  Comparing {len(input_list)} input entries against {len(value_map)} group values...", flush=True)
+
+    found: list[tuple[str, dict]] = []
+    missing_from_group: list[str] = []
+    for entry in input_list:
+        norm = normalize_addr(entry)
+        if norm in value_map:
+            found.append((entry, value_map[norm]))
+        else:
+            missing_from_group.append(entry)
+
+    extra_in_group: list[dict] = [row for norm, row in value_map.items() if norm not in norm_input]
+
+    if verbose:
+        print(
+            f"  Result: {len(found)} matched, "
+            f"{len(missing_from_group)} missing from group, "
+            f"{len(extra_in_group)} extra in group.",
+            flush=True,
+        )
+
+    return found, missing_from_group, extra_in_group
+
+
+def print_diff(group_name: str, found: list, missing_from_group: list, extra_in_group: list) -> None:
+    print(f"Address Group: {group_name}  [diff mode]")
+    print()
+    print(f"  MATCHED            ({len(found)})")
+    for entry, row in found:
+        annotation = f"→ {row['member']}  ({row['addr_type']}: {row['value']})" if row["value"] else f"→ {row['member']}"
+        print(f"    {entry:<30} {annotation}")
+    print()
+    print(f"  MISSING FROM GROUP ({len(missing_from_group)})   [in your list, not in group]")
+    for entry in missing_from_group:
+        print(f"    {entry}")
+    print()
+    print(f"  EXTRA IN GROUP     ({len(extra_in_group)})   [in group, not in your list]")
+    for row in extra_in_group:
+        annotation = f"({row['addr_type']}: {row['value']})" if row["value"] else ""
+        print(f"    {row['member']:<40} {annotation}")
+
+
+def write_diff_csv(found: list, missing_from_group: list, extra_in_group: list, filepath: str) -> None:
+    """Write a full diff report CSV with a direction column."""
+    fieldnames = ["direction", "input_value", "object_name", "object_value"]
+    with open(filepath, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer.writeheader()
+        for entry, row in found:
+            writer.writerow({"direction": "matched", "input_value": entry,
+                             "object_name": row["member"], "object_value": row["value"]})
+        for entry in missing_from_group:
+            writer.writerow({"direction": "missing_from_group", "input_value": entry,
+                             "object_name": "", "object_value": ""})
+        for row in extra_in_group:
+            writer.writerow({"direction": "extra_in_group", "input_value": "",
+                             "object_name": row["member"], "object_value": row["value"]})
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -359,16 +481,29 @@ def main() -> None:
     )
     parser.add_argument(
         "--compare", metavar="FILE", dest="compare_file",
-        help="Compare a host/IP list against the group and report missing entries",
+        help="Compare a host/IP list against the group — shows what's missing from the group",
+    )
+    parser.add_argument(
+        "--diff", metavar="FILE", dest="diff_file",
+        help="Two-way diff — shows what's missing from the group AND what's extra in the group",
+    )
+    parser.add_argument(
+        "--quiet", "-q", action="store_true",
+        help="Suppress progress output (only show final results)",
     )
     args = parser.parse_args()
+    verbose = not args.quiet
+
+    if args.compare_file and args.diff_file:
+        print("Error: --compare and --diff cannot be used together.")
+        sys.exit(1)
 
     if args.device_group:
         lib.DEVICE_GROUP = args.device_group
         lib.MODE = "panorama"
 
-    if args.compare_file and len(args.names) > 1:
-        print("Error: --compare requires exactly one group name.")
+    if (args.compare_file or args.diff_file) and len(args.names) > 1:
+        print("Error: --compare / --diff requires exactly one group name.")
         sys.exit(1)
 
     print(f"Target : {lib.TARGET_HOST}  [{lib.mode_summary()}]  v{VERSION}")
@@ -380,8 +515,18 @@ def main() -> None:
     # ── Compare mode ──────────────────────────────────────────────────────────
     if args.compare_file:
         group_name = args.names[0]
-        input_list = load_input_list(args.compare_file)
-        found, missing = run_compare(group_name, input_list, args.group_type, args.shared)
+        if verbose:
+            print(f"  Loading input: {args.compare_file}...", flush=True)
+        try:
+            input_list = load_input_list(args.compare_file)
+        except FileNotFoundError:
+            print(f"Error: Input file not found: {args.compare_file}")
+            sys.exit(1)
+        except OSError as e:
+            print(f"Error: Could not read input file '{args.compare_file}': {e.strerror}")
+            sys.exit(1)
+        found, missing = run_compare(group_name, input_list, args.group_type, args.shared, verbose)
+        print()
 
         print_compare(group_name, found, missing)
 
@@ -395,19 +540,51 @@ def main() -> None:
             print(f"Deploy : {deploy_file}  ({len(missing)} objects)")
         return
 
+    # ── Diff mode ─────────────────────────────────────────────────────────────
+    if args.diff_file:
+        group_name = args.names[0]
+        if verbose:
+            print(f"  Loading input: {args.diff_file}...", flush=True)
+        try:
+            input_list = load_input_list(args.diff_file)
+        except FileNotFoundError:
+            print(f"Error: Input file not found: {args.diff_file}")
+            sys.exit(1)
+        except OSError as e:
+            print(f"Error: Could not read input file '{args.diff_file}': {e.strerror}")
+            sys.exit(1)
+        found, missing_from_group, extra_in_group = run_diff(
+            group_name, input_list, args.group_type, args.shared, verbose
+        )
+        print()
+
+        print_diff(group_name, found, missing_from_group, extra_in_group)
+
+        report_file = f"check-group-diff-{ts}.csv"
+        write_diff_csv(found, missing_from_group, extra_in_group, report_file)
+        print(
+            f"\nReport : {report_file}  "
+            f"({len(found)} matched, {len(missing_from_group)} missing from group, "
+            f"{len(extra_in_group)} extra in group)"
+        )
+
+        if missing_from_group:
+            deploy_file = f"check-group-missing-{ts}.csv"
+            write_deploy_csv(missing_from_group, deploy_file, lib.DEVICE_GROUP)
+            print(f"Deploy : {deploy_file}  ({len(missing_from_group)} objects)")
+        return
+
     # ── Normal lookup mode ────────────────────────────────────────────────────
+    multi_group = len(args.names) > 1
+    all_rows: list[dict] = []
     for i, name in enumerate(args.names):
         if i > 0:
             print()
         if args.expand:
-            print_expanded(name, args.group_type, args.shared)
+            rows = print_expanded(name, args.group_type, args.shared, verbose)
         else:
-            print_flat(name, args.group_type, args.shared)
-
-    multi_group = len(args.names) > 1
-    all_rows: list[dict] = []
-    for name in args.names:
-        all_rows.extend(collect_members(name, args.group_type, args.shared))
+            rows = print_flat(name, args.group_type, args.shared, verbose)
+        all_rows.extend(rows)
 
     outfile = f"check-group-{ts}.{args.format}"
     if args.format == "csv":
