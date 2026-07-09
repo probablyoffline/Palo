@@ -31,7 +31,7 @@ import xml.etree.ElementTree as ET
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "libs"))
 import ops_lib as lib  # noqa: E402
 
-VERSION = "1.4.1"
+VERSION = "1.5.0"
 
 _IP_RE = re.compile(r'^\d{1,3}(\.\d{1,3}){3}$')
 
@@ -44,108 +44,127 @@ _GROUP_SUFFIX = {
 }
 
 
-def _group_xpath(name: str, group_type: str, shared: bool) -> str:
-    base = "/config/shared" if shared else lib._config_base()
-    return f"{base}/{_GROUP_SUFFIX[group_type]}/entry[@name='{name}']"
+# ── Bulk fetch helpers ────────────────────────────────────────────────────────
+
+def _base(shared: bool) -> str:
+    return "/config/shared" if shared else lib._config_base()
 
 
-def _address_xpath(name: str, shared: bool) -> str:
-    if shared:
-        return f"/config/shared/address/entry[@name='{name}']"
-    return f"{lib._config_base()}/address/entry[@name='{name}']"
-
-
-# ── Fetch helpers ─────────────────────────────────────────────────────────────
-
-def get_group_members(name: str, group_type: str, shared: bool) -> list[str] | None:
-    """Return the member list for a group, or None if the group doesn't exist."""
-    xpath = _group_xpath(name, group_type, shared)
+def fetch_all_groups(group_type: str, shared: bool) -> dict[str, list[str]]:
+    """One API call — returns {group_name: [member, ...]} for every group of this type."""
+    xpath = f"{_base(shared)}/{_GROUP_SUFFIX[group_type]}"
     xml_text = lib.api_get(xpath)
     if 'status="error"' in xml_text or "<entry" not in xml_text:
-        return None
+        return {}
     try:
         root = ET.fromstring(xml_text)
-        return [m.text for m in root.iter("member") if m.text]
+        return {
+            e.get("name"): [m.text for m in e.iter("member") if m.text]
+            for e in root.iter("entry") if e.get("name")
+        }
     except ET.ParseError:
-        return None
+        return {}
 
 
-def resolve_address_object(name: str, shared: bool) -> str | None:
-    """Return 'type: value' for a leaf address object, or None if not found."""
-    xpath = _address_xpath(name, shared)
+def fetch_all_address_objects(shared: bool) -> dict[str, tuple[str, str]]:
+    """One API call — returns {obj_name: (addr_type, value)} for every address object."""
+    xpath = f"{_base(shared)}/address"
     xml_text = lib.api_get(xpath)
     if 'status="error"' in xml_text or "<entry" not in xml_text:
-        return None
+        return {}
     try:
         root = ET.fromstring(xml_text)
-        entry = root.find(".//entry")
-        if entry is None:
-            return None
-        for atype in ("ip-netmask", "fqdn", "ip-range", "ip-wildcard"):
-            val = entry.findtext(atype)
-            if val:
-                return f"{atype}: {val}"
-        return None
+        result: dict[str, tuple[str, str]] = {}
+        for entry in root.iter("entry"):
+            name = entry.get("name")
+            if not name:
+                continue
+            for atype in ("ip-netmask", "fqdn", "ip-range", "ip-wildcard"):
+                val = entry.findtext(atype)
+                if val:
+                    result[name] = (atype, val)
+                    break
+        return result
     except ET.ParseError:
-        return None
+        return {}
 
 
-# ── Expand (recursive) ────────────────────────────────────────────────────────
+# ── Expand (recursive, works from pre-fetched dicts) ─────────────────────────
 
-def _expand(name: str, group_type: str, shared: bool, depth: int, seen: frozenset,
-            verbose: bool = False):
-    """
-    Yield (depth, member_name, is_group, annotation) tuples.
-    `is_group=True` means this line is itself a nested group header.
-    """
-    members = get_group_members(name, group_type, shared)
+def _expand(
+    name: str,
+    groups: dict[str, list[str]],
+    objects: dict[str, tuple[str, str]],
+    depth: int,
+    seen: frozenset,
+    verbose: bool = False,
+):
+    """Yield (depth, member_name, is_group, annotation) using cached bulk data."""
+    members = groups.get(name)
     if members is None:
         return
 
     for member in members:
         if member in seen:
             if verbose:
-                indent = "  " * depth
-                print(f"    {indent}{member}  [circular reference — skipped]", flush=True)
+                print(f"    {'  ' * depth}{member}  [circular reference — skipped]", flush=True)
             yield (depth, member, False, "[circular reference — skipped]")
             continue
 
-        sub_members = get_group_members(member, group_type, shared)
-        if sub_members is not None:
+        if member in groups:
             if verbose:
-                indent = "  " * depth
-                print(f"    {indent}{member}  [nested group — expanding]", flush=True)
+                print(f"    {'  ' * depth}{member}  [nested group — expanding]", flush=True)
             yield (depth, member, True, None)
-            yield from _expand(member, group_type, shared, depth + 1, seen | {name}, verbose)
+            yield from _expand(member, groups, objects, depth + 1, seen | {name}, verbose)
         else:
             annotation = None
-            if group_type == "address":
-                annotation = resolve_address_object(member, shared)
+            if member in objects:
+                atype, val = objects[member]
+                annotation = f"{atype}: {val}"
             if verbose:
-                indent = "  " * depth
                 val_str = f"  ({annotation})" if annotation else ""
-                print(f"    {indent}{member:<40}{val_str}", flush=True)
+                print(f"    {'  ' * depth}{member:<40}{val_str}", flush=True)
             yield (depth, member, False, annotation)
 
 
 # ── Data collection ───────────────────────────────────────────────────────────
 
-def collect_members(group_name: str, group_type: str, shared: bool,
-                    verbose: bool = False) -> list[dict]:
+def collect_members(
+    group_name: str,
+    group_type: str,
+    shared: bool,
+    verbose: bool = False,
+) -> list[dict] | None:
     """
-    Collect all leaf members with resolved values (flat — no tree structure).
-    Returns list of {group, member, addr_type, value} dicts.
+    Bulk-fetch all groups and objects (2 API calls total), then resolve members locally.
+    Returns None if the group doesn't exist, [] if empty, or list of resolved member dicts.
     """
     if verbose:
-        print(f"  Fetching {group_name}...", flush=True)
+        print(f"  Fetching all {group_type} groups...", flush=True)
+    groups = fetch_all_groups(group_type, shared)
+
+    if group_name not in groups:
+        return None
+
+    objects: dict[str, tuple[str, str]] = {}
+    if group_type == "address":
+        if verbose:
+            print(f"  Fetching all address objects...", flush=True)
+        objects = fetch_all_address_objects(shared)
+
+    if verbose:
+        direct = len(groups[group_name])
+        print(f"  Expanding {group_name} ({direct} direct member(s))...", flush=True)
+
     rows = []
-    for _depth, name, is_group, annotation in _expand(group_name, group_type, shared, 0, frozenset(), verbose):
+    for _depth, name, is_group, annotation in _expand(group_name, groups, objects, 0, frozenset(), verbose):
         if is_group:
             continue
         addr_type = value = ""
         if annotation and ": " in annotation:
             addr_type, value = annotation.split(": ", 1)
         rows.append({"group": group_name, "member": name, "addr_type": addr_type, "value": value})
+
     if verbose:
         print(f"  {len(rows)} members resolved.", flush=True)
     return rows
@@ -159,13 +178,15 @@ def print_flat(group_name: str, group_type: str, shared: bool,
     label = group_type.capitalize() + " Group"
     rows = collect_members(group_name, group_type, shared, verbose)
     print(f"{label}: {group_name}")
+    if rows is None:
+        print("  [not found]")
+        return []
     if not rows:
-        members = get_group_members(group_name, group_type, shared)
-        print("  [not found]" if members is None else "  [empty group]")
-    else:
-        for row in rows:
-            annotation = f"({row['addr_type']}: {row['value']})" if row["value"] else ""
-            print(f"  {row['member']:<40} {annotation}")
+        print("  [empty group]")
+        return []
+    for row in rows:
+        annotation = f"({row['addr_type']}: {row['value']})" if row["value"] else ""
+        print(f"  {row['member']:<40} {annotation}")
     return rows
 
 
@@ -173,27 +194,33 @@ def print_expanded(group_name: str, group_type: str, shared: bool,
                    verbose: bool = False) -> list[dict]:
     """Display tree-structured member list and return leaf rows for file output."""
     label = group_type.capitalize() + " Group"
-    members = get_group_members(group_name, group_type, shared)
     print(f"{label}: {group_name}  [expanded]")
-    if members is None:
+
+    if verbose:
+        print(f"  Fetching all {group_type} groups...", flush=True)
+    groups = fetch_all_groups(group_type, shared)
+
+    if group_name not in groups:
         print("  [not found]")
         return []
-    if not members:
+    if not groups[group_name]:
         print("  [empty group]")
         return []
 
-    if verbose:
-        print(f"  Fetching {group_name}...", flush=True)
+    objects: dict[str, tuple[str, str]] = {}
+    if group_type == "address":
+        if verbose:
+            print(f"  Fetching all address objects...", flush=True)
+        objects = fetch_all_address_objects(shared)
+
     leaf_rows: list[dict] = []
-    for depth, name, is_group, annotation in _expand(group_name, group_type, shared, 0, frozenset(), verbose):
+    for depth, name, is_group, annotation in _expand(group_name, groups, objects, 0, frozenset(), verbose):
         indent = "  " + "    " * depth
         if is_group:
             print(f"{indent}{name}  [group]")
         elif annotation:
             print(f"{indent}{name:<40} ({annotation})")
-            addr_type, value = ("", "")
-            if ": " in annotation:
-                addr_type, value = annotation.split(": ", 1)
+            addr_type, value = annotation.split(": ", 1) if ": " in annotation else ("", "")
             leaf_rows.append({"group": group_name, "member": name, "addr_type": addr_type, "value": value})
         else:
             print(f"{indent}{name}")
@@ -298,10 +325,11 @@ def run_compare(
         print(f"  Resolving group members...", flush=True)
 
     rows = collect_members(group_name, group_type, shared, verbose)
-    value_map: dict[str, dict] = {}
-    for row in rows:
-        if row["value"]:
-            value_map[normalize_addr(row["value"])] = row
+    if rows is None:
+        print(f"Error: Group '{group_name}' not found.")
+        sys.exit(1)
+
+    value_map: dict[str, dict] = {normalize_addr(r["value"]): r for r in rows if r["value"]}
 
     if verbose:
         print(f"  Comparing {len(input_list)} input entries against {len(value_map)} group values...", flush=True)
@@ -391,6 +419,10 @@ def run_diff(
         print(f"  Resolving group members...", flush=True)
 
     rows = collect_members(group_name, group_type, shared, verbose)
+    if rows is None:
+        print(f"Error: Group '{group_name}' not found.")
+        sys.exit(1)
+
     value_map: dict[str, dict] = {normalize_addr(r["value"]): r for r in rows if r["value"]}
     norm_input: set[str] = {normalize_addr(e) for e in input_list}
 
